@@ -1,0 +1,359 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* 透明窗口下，鼠标事件只命中「已绘制」的像素。背景 alpha 必须 > 0，
+     否则移到空白处收不到 mousedown / contextmenu（右键菜单就弹不出来）。
+     0.002 肉眼不可见，但能被命中。 */
+  background: rgba(0, 0, 0, 0.002);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.subtitle {
+  position: fixed;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  max-width: 90%;
+  padding: 6px 12px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.4;
+  border-radius: 8px;
+  text-align: center;
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.busy {
+  position: fixed;
+  right: 10px;
+  top: 10px;
+  padding: 3px 8px;
+  background: rgba(80, 120, 255, 0.8);
+  color: #fff;
+  font-size: 11px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.hidden { display: none !important; }
+
+/* “正在跳哪支”：仅右键打开动作 UI / 设置面板时才显示的屏幕浮层，顶部居中，不挡人物 */
+.now-playing {
+  position: fixed;
+  left: 50%;
+  top: 10px;
+  transform: translateX(-50%);
+  max-width: 92%;
+  padding: 5px 14px;
+  background: rgba(79, 140, 255, 0.9);
+  color: #fff;
+  font-size: 13px;
+  font-family: 'Microsoft YaHei', system-ui, sans-serif;
+  line-height: 1.4;
+  border-radius: 999px;
+  text-align: center;
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  z-index: 2600;
+}
+
+/* 地面参考线（屏幕空间、固定不随角色动；不是阴影块） */
+.ground-line {
+  position: fixed;
+  left: 0; top: 0;
+  height: 3px;
+  background: rgba(120, 175, 255, 0.95);
+  border-radius: 2px;
+  pointer-events: none;
+  box-shadow: 0 0 6px rgba(120, 175, 255, 0.7);
+  z-index: 2400;
+}
+
+/* 动作菜单里高亮“正在跳”的那一项 */
+.pm-item.pm-active {
+  background: rgba(79, 140, 255, 0.32);
+  color: #fff;
+  box-shadow: inset 3px 0 0 #6f9bff;
+}
+.pm-item.pm-active:hover { background: rgba(79, 140, 255, 0.46); }
+
+/* ---------------- 右键展开菜单（Mate-Engine 风格：毛玻璃深色面板） ---------------- */
+.pet-menu {
+  position: fixed;
+  left: 0;
+  top: 0;
+  min-width: 152px;
+  max-width: min(400px, 94vw);
+  max-height: calc(100% - 8px);
+  overflow-y: auto;
+  padding: 5px;
+  background: rgba(24, 24, 30, 0.94);
+  color: #f0f0f4;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  font-family: 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 12.5px;
+  z-index: 3000;
+}
+
+.pet-menu::-webkit-scrollbar { width: 6px; }
+.pet-menu::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+
+.pm-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: #e8e8ee;
+}
+
+.pm-item:hover { background: rgba(255, 255, 255, 0.14); }
+.pm-ico { width: 16px; text-align: center; opacity: 0.92; flex: none; }
+.pm-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pm-arrow { margin-left: auto; opacity: 0.6; }
+.pm-val { margin-left: auto; color: #8ab4f8; font-size: 11.5px; }
+.pm-sep { height: 1px; margin: 4px 6px; background: rgba(255, 255, 255, 0.12); }
+.pm-title { padding: 5px 10px 3px; font-size: 11px; color: #9aa3b2; }
+.pm-empty { padding: 6px 10px; color: #888; font-size: 11.5px; }
+
+/* 右键菜单里的真滑块行（把"弱/中/强"三档换成可拖动自定义） */
+.pm-slider-row { gap: 8px; padding-right: 10px; cursor: default; }
+.pm-slider-row:hover { background: rgba(255, 255, 255, 0.08); }
+.pm-slider-row .pm-label { flex: none; max-width: 40%; }
+.pm-slider-row .pm-range { flex: 1 1 auto; min-width: 88px; accent-color: #6f9bff; cursor: pointer; }
+.pm-slider-row .pm-val { flex: none; min-width: 36px; text-align: right; }
+
+/* 根级环形径向菜单：容器透明，仅显示环绕的菜单芯片 */
+.pet-menu.radial {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: visible;
+  min-width: 0;
+  max-width: none;
+  max-height: none;
+}
+.pet-menu.radial::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0;
+  width: 8px; height: 8px;
+  margin: -4px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.5);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+}
+.pet-menu.radial .pm-item {
+  background: rgba(24, 24, 30, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+}
+
+/* ---------------- 设置面板（Mate-Engine 风格：分区、滑条/开关/下拉/取色） ---------------- */
+.settings-panel {
+  position: fixed;
+  right: 12px;
+  left: auto;
+  /* ★ 贴右下角（用户要求：看着舒服）。用 bottom 而不是 top 作为锚点 ⇒ 面板从底部往上长。
+     拖动时 makeDraggable 会把 bottom 清成 auto（否则 top/bottom 同时存在会把面板拉长）。 */
+  bottom: 12px;
+  top: auto;
+  width: 300px;            /* 260 → 300：用户要求"面板再宽一点，把数值显示全"，代价由画布自动加宽吸收 */
+  box-sizing: border-box;
+  max-height: calc(100% - 32px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(22, 22, 28, 0.96);
+  color: #eef0f6;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  font-family: 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 12.5px;
+  z-index: 4000;
+  overflow: hidden;
+}
+.sp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  cursor: move;
+  background: rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  user-select: none;
+}
+.sp-close {
+  width: 22px; height: 22px; border: none; border-radius: 6px;
+  background: rgba(255, 255, 255, 0.1); color: #fff; cursor: pointer; font-size: 15px; line-height: 1;
+}
+.sp-close:hover { background: rgba(255, 90, 90, 0.6); }
+.sp-body { padding: 6px 10px 12px; overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0; }
+.sp-body::-webkit-scrollbar { width: 6px; }
+.sp-body::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+.sp-sec { margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.sp-sec:first-child { border-top: none; margin-top: 0; }
+.sp-sec-title { font-size: 11.5px; color: #8ab4f8; margin: 2px 2px 6px; font-weight: 600; }
+.sp-row { display: flex; align-items: center; gap: 8px; padding: 3px 2px; min-width: 0; }
+/* 标签可压缩 + 省略号：宁可截标签，也不让整行溢出（一行溢出 ⇒ 整个面板出现横向滚动，数值就看不见了） */
+.sp-label { flex: 0 1 auto; min-width: 84px; max-width: 44%; color: #d6d9e2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* ★★ 长标签（9 字以上）例外：**换行显示完整**，不再被省略号截成"看不懂的几个字"
+   （用户反馈：备注字多被挤掉省略了，就剩几个字）。悬停另有 title 显示全文。 */
+.sp-label.sp-label-wrap { max-width: 72%; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.35; }
+/* 数值**覆盖在滑块轨道正中间**：不再占右边一列 ⇒ 面板再窄也能一眼看到"调了多少" */
+.sp-range-wrap { position: relative; flex: 1 1 auto; min-width: 0; display: flex; align-items: center; }
+.sp-val {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  pointer-events: none;                 /* 指针穿透，不影响拖动滑条 */
+  color: #eaf0ff; font-size: 11px; line-height: 15px;
+  padding: 0 5px; border-radius: 8px;
+  background: rgba(18, 20, 28, 0.72);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  z-index: 2;
+}
+.sp-range { width: 100%; accent-color: #6f9bff; }
+.sp-select { flex: 1; background: rgba(40, 42, 54, 0.96); color: #fff; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 6px; padding: 3px 6px; }
+/* 下拉展开后的列表：透明窗体下原生 select 弹出层容易“白字白底”看不见，强制深色底+白字 */
+.sp-select option { background: #282a36; color: #fff; }
+.sp-color { flex: 1; height: 24px; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 6px; background: none; cursor: pointer; }
+.sp-toggle {
+  flex: 0 0 52px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 14px;
+  background: rgba(255, 255, 255, 0.08); color: #c8ccd8; padding: 3px 0; cursor: pointer; font-size: 11.5px;
+}
+.sp-toggle.on { background: #4f8cff; color: #fff; border-color: #4f8cff; }
+/* ★ 内层滚动区间（用户偏好的做法）：列表自己滚，不把整块面板撑长。
+   132px 只有三行 ⇒ 66 个动作要滑很久；提到 ~38vh/300px（仍是内部滚动）。 */
+.sp-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; max-height: min(38vh, 300px); overflow-y: auto; align-content: flex-start; padding-right: 2px; }
+.sp-actions::-webkit-scrollbar { width: 6px; }
+.sp-actions::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+.sp-btn {
+  border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08); color: #dfe3ee; cursor: pointer;
+  padding: 4px 10px; font-size: 11.5px;
+}
+.sp-btn:hover { background: rgba(111, 155, 255, 0.35); }
+/* ★ v11.49 动作列表**按曲名分组**（曲包一多，平铺几十上百个按钮根本没法找）：
+   组头一行 + 可折叠的组内按钮（点组头展开/收起）。 */
+.sp-group { display: block; width: 100%; }
+.sp-group-head { font-weight: 600; background: rgba(255, 255, 255, 0.14); width: 100%; text-align: left; }
+.sp-group-body { margin: 4px 0 8px 0; padding-left: 10px; border-left: 2px solid rgba(255, 255, 255, 0.14); max-height: none; }
+.hidden { display: none !important; }
+/* 浮层里的"一条一行"列表（动作 / 表情）：形态照右键菜单 —— 行更高、字号更大、**带分隔线**，
+   悬停/选中都有明显反馈。之前做成"透明行 + 1px 间距"，几十条糊成一片，一条都看不清（被吐槽过）。 */
+/* ★ 用 block 而不是 flex 竖列：flex 竖列里条目默认 flex-shrink:1，内容超高时会**被纵向压扁** ⇒
+   几十条挤在一起、文字互相重叠（实测"字都看不清"就是这个）。block 排布 + 容器滚动才是对的。 */
+.sp-list { display: block; max-height: min(52vh, 420px); overflow-y: auto; padding: 2px 0; }
+.sp-list::-webkit-scrollbar { width: 6px; }
+.sp-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+.sp-list-item {
+  display: block; flex: none; width: 100%; text-align: left;
+  border: none; border-bottom: 1px solid rgba(255, 255, 255, 0.07); border-radius: 0;
+  background: transparent; color: #e8ecf5; cursor: pointer;
+  padding: 7px 9px; font-size: 12.5px; line-height: 1.4; font-family: inherit;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sp-list-item:last-child { border-bottom: none; }
+.sp-list-item:hover { background: rgba(111, 155, 255, 0.24); }
+.sp-list-item.sp-active { background: rgba(79, 140, 255, 0.32); color: #fff; box-shadow: inset 3px 0 0 #6f9bff; }
+.sp-list-sep { height: 1px; background: rgba(255, 255, 255, 0.12); margin: 5px 0; }
+/* 动作列表里“正在播放”的那一项高亮 */
+.sp-btn-active { background: #4f8cff; color: #fff; border-color: #4f8cff; box-shadow: 0 0 0 1px #6f9bff; }
+.sp-btn-active:hover { background: #3f7ef0; }
+.sp-note { font-size: 11px; color: #9aa3b2; line-height: 1.45; padding: 2px 2px 6px; }
+.sp-bones { margin-top: 6px; }
+.sp-bone-name { font-size: 11px; color: #9aa3b2; margin: 6px 2px 2px; }
+
+/* 选模型弹窗（import_model 递归扫描后让用户挑一个；遮罩不挡穿透，只有面板本身可点） */
+.sp-modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;   /* 遮罩层不拦截：点面板外区域穿透到桌面 */
+  z-index: 5000;
+}
+.sp-modal-box {
+  width: min(340px, 92vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  pointer-events: auto;   /* 只有面板本身可交互 */
+  background: rgba(22, 22, 28, 0.97);
+  color: #eef0f6;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  font-family: 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 12.5px;
+  overflow: hidden;
+}
+.sp-modal-title {
+  padding: 11px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #8ab4f8;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  word-break: break-all;
+}
+.sp-modal-list {
+  padding: 6px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sp-modal-list::-webkit-scrollbar { width: 6px; }
+.sp-modal-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+.sp-modal-item {
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #e8e8ee;
+  cursor: pointer;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-modal-item:hover { background: rgba(111, 155, 255, 0.32); border-color: #6f9bff; }
+.sp-modal-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 8px;
+}

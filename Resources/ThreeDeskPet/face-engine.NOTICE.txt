@@ -1,0 +1,9 @@
+face-engine.js 内嵌了以下项目的代码（已编译为单文件 IIFE，运行时无外部依赖）：
+
+  SoullinkEmotion3D  https://github.com/nanlingyin/SoullinkEmotion3D
+  Soullink Emotion SDK  https://github.com/nanlingyin/soullink-emotion-sdk
+  许可：Apache License 2.0（全文见 face-engine.LICENSE.txt）
+
+仅取用了其中的 VAD 情绪空间、FACS/AU 合成、ARKit 映射与模型适配算法；
+未包含该项目的任何示例模型、贴图或演示素材（那些不在 Apache-2.0 范围内）。
+修改：为 Alife 桌宠增加了 VRM 标准预设兜底绑定与 AlifeFace 适配层（见构建源 src/alife-face.ts）。

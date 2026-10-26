@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D 桌宠</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.js",
+      "three-vrm-animation": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.4.0/lib/three-vrm-animation.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="canvas" data-drag></canvas>
+  <div id="subtitle" class="subtitle hidden"></div>
+  <div id="busy" class="busy hidden">思考中…</div>
+  <div id="now-playing" class="now-playing hidden"></div>
+  <div id="ground-line-l" class="ground-line hidden"></div>
+  <div id="ground-line-r" class="ground-line hidden"></div>
+  <div id="pet-menu" class="pet-menu hidden"></div>
+  <div id="settings-panel" class="settings-panel hidden"></div>
+
+
+
+
+ 
+<!-- ★★ 2026-10-16 根治"改了代码不生效"：静态 <script src="xxx.js"> 会被 WebView2 缓存住 ⇒ 改完重启也不加载新文件。
+     现在带"加载时刻"查询串 + 串行加载（onload 链），保证 pet.js（依赖前 5 个全局对象）最后执行。 -->
+<script>
+ (function () {
+  var t = '?t=' + Date.now();
+  var list = ['embodied-compose.js', 'embodied-validate.js', 'ardy-retarget.js', 'ardy-web/ardy-client.js', 'embodied-expression.js', 'face-engine.js'];
+  var i = 0;
+  function next() {
+   if (i >= list.length) {
+    var m = document.createElement('script'); m.type = 'module'; m.src = 'pet.js' + t; document.body.appendChild(m); return;
+   }
+   var s = document.createElement('script'); s.src = list[i++] + t; s.onload = next; s.onerror = next; document.body.appendChild(s);
+  }
+  next();
+ })();
+</script>
+</body>
+</html>

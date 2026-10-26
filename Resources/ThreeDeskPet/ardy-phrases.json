@@ -1,0 +1,156 @@
+{
+  "_note": "生成式动作(ardy-mini)的可用词条（闭集）。规则：每条必须真机实测过『签名』才可从 candidates 移入 verified；被证伪的进 rejected，并记录原因。AI 的 <bodyact prompt> 只允许用 verified 里的原句（换说法=抽盲盒，因为它用的是语义向量编码器）。",
+  "_howToVerify": "点设置面板「第1步自检(试跑 ardy)」/「第2步自检(生成→重定向→播放)」，看日志里的三行：原始姿势[首帧]（手应在身侧偏下）/ 根位移（竖向=起落, 水平=位移）/ 下肢抽查（大小腿方向不同=真屈膝）。三条都能对上才算 verified。★ 批量做法：点「批量试跑候选词条」，它会把下面 candidates **一次跑完**并在日志里按 [词条试跑 i/N] 分段 —— 跑完把日志给开发者，判定通过的写进 verified（写进去后 AI 立刻能用 <motion option=\"gen:标签\"/> 调用，因为 C# 是**读这个文件**建词条的）。",
+  "_signatureV2_20261014": "★ 2026-10-14 签名已补齐（ardy-client.js 的「动作签名 v2」）：除原有的『右手高于肩 / 右膝角』，新增 **左手 / 头部朝向(头相对髋的上·前分量) / 头 yaw / 根位移(水平·竖直) / 骨盆 yaw** ⇒ 本文件 10 条 verified 的 expect 全部有据可判（低头/抬头/环顾/走路/跳跃起落不再都打印同一串数字）。日志行：`[ardy] 动作签名 首帧 …｜中帧 …` + `动作签名 采样 …`（6 帧）。",
+  "_autoVerify_20261014": "★ 同时补上『失败处理』（此前只有判定没有处理）：AI 下发 `gen:标签` → ardyPlayVerified：**生成(dry-run，不喂桌宠) → 按本条 expect 自动验收 → 不过 ⇒ 换 seed 重试一次 → 仍不过 ⇒ 不播放，退回预置动作(hands_up)**，并把结论写进 <bodystate> 的「生成式动作：…」。判据阈值都来自各条 evidence（膝 45°、骨盆 yaw 12°、头前分量 0.06、头 yaw 变化 12°、手↔头 0.8×髋↔头）。★ slow / fast **暂无可靠阈值 ⇒ 标『未校准』，只记录不拦**（缺样本：同一条词条跑两次就能定）。",
+  "_verifiedIsRuntime": "★ verified 段是**运行时数据源**（不是给人看的笔记）：ThreeDeskPet.cs 的 GenPhrases 会读它，生成 <motion option=\"gen:标签\"/> 的实现。所以往这里加一条 = AI 下一轮就能用；被证伪的必须移到 rejected（否则它会一直拿着一条坏词条去生成）。",
+  "_squatRule": "★『蹲 / 跪』不要用 prompt（生成式）：这个模型没有地面/接触/IK 概念，它的训练数据里『squat』= 健身宽站蹲（两腿向两侧岔开成马步、还带跨步），根位移还会上下起伏 —— 看着完全不像蹲。蹲/跪有确定解，用 <bodyact spec='{\"crouch\":0.8}'/> 或 {\"kneel\":1}（解析 IK：膝屈 + 骨盆高度 + 勾脚联立解，脚自动踩地）。已把 squat 类词条全部移入 rejected。",
+  "_dedupe20261014": "★ 2026-10-14 去重：原 22 条里 **11 条是『站立/待机』换皮**（签名完全相同：手 −0.53/膝 12°）、另有 2 条敬礼 + 2 条点头 + 2 条双手过顶 ⇒ 用户实测原话『感觉有一部分都是重复的』。现在只保留**语义互不重复**的：待机类留 1 条、低头/抬头/环顾各 1（这是桌宠最常用的『小反馈』）、敬礼/点头/欢呼各 1。判定结论用本次(10-14 11:39)批量试跑的签名证据。",
+  "verified": [
+    {
+      "phrase": "a person raises the right hand high above the head and waves hello",
+      "label": "举手挥手",
+      "expect": { "rightHandAboveShoulder": true, "bodyYawSmall": true },
+      "evidence": "2026-10-11 实测：中帧右臂=[-0.68,0.72,0.15]（Y=+0.72 举过头）；首帧双臂自然下垂；方向落地校验 14/14；骨盆 yaw 4.4°"
+    },
+    {
+      "phrase": "a person does jumping jacks",
+      "label": "开合跳",
+      "expect": { "rightHandAboveShoulder": true, "kneeBend": true, "armsSwing": true },
+      "evidence": "2026-10-14 11:39 批量试跑签名：首帧 手高于肩 −0.52/膝 24° → 中帧 **+0.59/膝 65°**（双臂真的举起 + 真屈膝 + 有明显起伏）"
+    },
+    {
+      "phrase": "a person waves both hands overhead",
+      "label": "双手过顶挥",
+      "expect": { "bothHandsAboveShoulder": true, "kneeBend": false },
+      "evidence": "2026-10-14 11:39 签名：首帧 −0.48/膝 18° → 中帧 **+0.57/膝 14°**（双手举过头；下肢不动，符合『站着挥手』）"
+    },
+    {
+      "phrase": "a person stretches their arms up to the sky",
+      "label": "伸懒腰",
+      "expect": { "bothHandsAboveShoulder": true, "slow": true },
+      "evidence": "2026-10-14 11:39 签名：首帧 −0.53/膝 12° → 中帧 **+0.43/膝 12°**（双手上举；比『双手过顶挥』幅度小、更静 ⇒ 两条语义不同，都保留）"
+    },
+    {
+      "phrase": "A person is standing in a place, lowering their head and neck in a forward direction.",
+      "label": "低头",
+      "expect": { "headPitchForward": true, "handsDown": true },
+      "evidence": "2026-10-14 11:39 签名：手 −0.53→−0.54（双手保持垂下 ✓ 符合『只低头』）。★ 注意：现签名只量手/膝，**量不到头部** ⇒ 此条的头部方向待「含头部的签名」加入后再复核。"
+    },
+    {
+      "phrase": "A person is standing in a place and moving his neck up, pointing his head upwards.",
+      "label": "抬头",
+      "expect": { "headPitchUp": true, "handsDown": true },
+      "evidence": "2026-10-14 11:39 签名：手 −0.54→−0.54（双手垂下 ✓）。头部方向待含头签名复核（同「低头」条）。"
+    },
+    {
+      "phrase": "A person, while standing, is looking upward across different directions.",
+      "label": "抬头环顾",
+      "expect": { "headYawChange": true, "handsDown": true },
+      "evidence": "2026-10-14 11:39 签名：手 −0.56→−0.57（双手垂下 ✓）。头部/朝向变化待含头签名复核。"
+    },
+    {
+      "phrase": "A person salutes by raising their right arm to their forehead.",
+      "label": "敬礼",
+      "expect": { "rightHandToHead": true },
+      "evidence": "2026-10-14 11:39 两条敬礼词条里保留这一条（另一条 'standing upright raises their right arm to their head in a salute' 语义重复，已删）"
+    },
+    {
+      "phrase": "A person is standing, slightly nodding their head quickly.",
+      "label": "快速点头",
+      "expect": { "headPitchSmall": true, "fast": true },
+      "evidence": "2026-10-14 11:39 两条点头词条里保留这一条（'stands still while facing forward and nodding their head side to side' 是**横向**点头、语义不同但桌宠很少用，已删）"
+    },
+    {
+      "phrase": "A person is cheering by waving their hand up while standing and facing forward.",
+      "label": "欢呼挥手",
+      "expect": { "handAboveShoulder": true },
+      "evidence": "2026-10-14 11:39 签名：首帧 +0.41/膝 27° → 中帧 **+0.56/膝 28°**（手在肩以上 ✓）。与「双手过顶挥」的区别：单手上举 + 带欢呼的躯干起伏，实测两条都成立 ⇒ 都留。"
+    }
+  ],
+  "candidates": [
+    {
+      "phrase": "a person marches in place",
+      "note": "10-14 试跑：首帧 −0.51/膝 22° = 中帧 −0.51/膝 22° ⇒ **几乎没动**（原地踏步应该有抬膝起伏）。保留待复核：需要更细的『逐帧膝角变化』判据，不是排除。"
+    },
+    {
+      "phrase": "a person walks forward",
+      "note": "10-14 试跑：手 −0.52→−0.53、膝 18°→12° ⇒ 符合『走路=手垂在身侧+小屈膝』，但**根位移是否真向前**要靠『根位移』那行判（本批未逐条打印）。复核通过即可入 verified。"
+    },
+    {
+      "phrase": "A person stands idle with their hands swaying slightly.",
+      "note": "待机类**只留这一条**（原来 11 条同义换皮，签名完全一致：手 −0.53/膝 12°）。"
+    },
+    {
+      "phrase": "A person standing with their hands positioned at the back.",
+      "note": "『背手』语义独特（手在身后），桌宠偶尔用得上；签名量不到『手在身后』，待复核。"
+    }
+  ],
+  "rejected": [
+    {
+      "phrase": "a person squats down and stands up",
+      "reason": "首帧双手已抬到胸前(0.45 高 / 0.52 前)，与『蹲下』意图不符；属模型语义理解偏差（2026-10-11 实测首帧数据）",
+      "note": "同一动作不同种子仍是同类怪姿势 → 该词条直接弃用"
+    },
+    {
+      "phrase": "a person does a deep squat exercise",
+      "reason": "生成的是**健身宽站蹲**：两腿向两侧岔开(马步)、还带跨步，根位移 Y 上下来回起伏 —— 不是『屈膝下沉、脚原地踩住』",
+      "note": "2026-10-11 用户实测（面板「蹲下自检」按钮 6 次）：腿部像马步一样岔开、跨步下沉、身体忽上忽下。★ 蹲请走 crouch 解析 IK。"
+    },
+    {
+      "phrase": "a person crouches down low and stands back up",
+      "reason": "同上：健身/舞蹈语料里的 crouch/squat 都是宽站 + 跨步，且带明显上下根位移",
+      "note": "★ 蹲请走 crouch"
+    },
+    {
+      "phrase": "a person bends their knees and lowers their body",
+      "reason": "『屈膝』歧义，生成结果常混入抬臂/弯腰，与意图不符",
+      "note": "★ 蹲请走 crouch"
+    },
+    {
+      "phrase": "A person is standing idle.",
+      "reason": "与 verified/candidates 里的待机条目**语义完全重复**（2026-10-14 去重：原 11 条待机换皮签名一模一样）",
+      "note": "★ 不该往词表里塞同义换皮 —— 生成式是闭集，重复条目只会让试跑日志看起来像『都是同一支动作』。"
+    },
+    {
+      "phrase": "A person is standing idle with arms relaxed down to the sides.",
+      "reason": "同义重复（同上）",
+      "note": "待机留 'hands swaying slightly' 一条即可"
+    },
+    {
+      "phrase": "A person stands upright facing forward.",
+      "reason": "同义重复（同上）",
+      "note": "—"
+    },
+    {
+      "phrase": "A person is standing with slight movement in their arms and shoulders.",
+      "reason": "同义重复（同上）",
+      "note": "—"
+    },
+    {
+      "phrase": "A person is standing idle, facing forward.",
+      "reason": "同义重复（同上）",
+      "note": "—"
+    },
+    {
+      "phrase": "A person is standing still.",
+      "reason": "同义重复（同上）",
+      "note": "—"
+    },
+    {
+      "phrase": "A person stands upright while slightly swaying their arms.",
+      "reason": "同义重复（同上）",
+      "note": "—"
+    },
+    {
+      "phrase": "A person standing upright raises their right arm to their head in a salute.",
+      "reason": "与保留的 'A person salutes by raising their right arm to their forehead.' **同义**（都是敬礼）",
+      "note": "敬礼留一条即可"
+    },
+    {
+      "phrase": "A person stands still while facing forward and nodding their head side to side.",
+      "reason": "与保留的『快速点头』相近；此条是横向点头，桌宠用得少（想要横向摇头 → 用 preset=shake 更准）",
+      "note": "摇头请走 <bodyact preset=\"shake\"/>"
+    }
+  ]
+}
