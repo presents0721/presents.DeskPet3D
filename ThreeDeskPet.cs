@@ -1896,7 +1896,9 @@ public partial class ThreeDeskPet(
             {
                 // NotifyIcon 没有 BeginInvoke；用其 STA 线程的同步上下文把销毁派发回去，避免跨线程释放踩坑
                 if (ctx is not null)
-                    ctx.Post(_ => { try { t.Visible = false; t.Dispose(); } catch { } try { UnregisterHotkeys(); } catch { } Application.Exit(); }, null);
+                    // 只能结束本托盘线程的消息泵；Application.Exit() 会在该线程上关闭主窗口，
+                    // 触发“是否直接关闭应用？”弹窗并导致跨线程访问 CoreWebView2 崩溃。
+                    ctx.Post(_ => { try { t.Visible = false; t.Dispose(); } catch { } try { UnregisterHotkeys(); } catch { } Application.ExitThread(); }, null);
                 else
                     try { t.Visible = false; t.Dispose(); } catch { }
             }
