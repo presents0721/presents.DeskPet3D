@@ -95,6 +95,19 @@ public class DeskPetService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
+    [Description("切换人物基础姿势：stand=站立；sit_full=全身坐（腿可见，普通窗口用这个）；sit=任务栏坐（只显示上半身）；lieback=仰躺。"
+        + "用户说『坐下/坐好/坐着/站起来/躺下』时用它；**不要用 bodyact 的 crouch 代替坐下**（crouch 只是蹲）。")]
+    public Task Pose(string option)
+    {
+        option = (option ?? "").Trim();
+        string p = option.ToLowerInvariant();
+        if (p != "stand" && p != "sit" && p != "sit_full" && p != "lieback")
+            throw new Exception("选项不存在");
+        pet.SetPosture(p);
+        return Task.CompletedTask;
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
     // ★★ v11.48 规则重写（用户实测：AI 发 `<Motion option="vrma/004_hello_1" seconds="3"/>`，
     //   可该动作全长 15.77s、前 3 秒是背身、第 4 秒才转身打招呼 ⇒ 播 3 秒等于什么都没展示）。
     //   病根在**规则**：把 seconds 说成"保持多久"，AI 就会随手填个小数；
@@ -105,6 +118,7 @@ public class DeskPetService(
         + "实测某支打招呼动作全长 15.8 秒、前 3 秒是背身、第 4 秒才转身打招呼，填短秒数会正好停在没内容的那段。"
         + "只有想让它**多循环一会儿**（跳舞、待机晃动）才填 seconds，且要填够长（≥15）；填 0 或负数=一直保持。"
         + "option 也能写 `gen:词条`（如 gen:举手挥手）→ 由本地模型**现场生成**一个新动作（词条表见附加说明）；"
+        + "★gen: 模式下 seconds 还可控制生成长度：不填=4 秒；填大于 4 会按 4 秒分段生成并**连续播放**（最多 12 秒）。"
         + "★使用频率：不是每次回复都要用 —— 只在对话本身含明确动作意图（打招呼/告别/道谢/被夸/被责备/说到动作词）时才用，"
         + "普通问答与闲聊一律不用；同一条回复最多 1 个动作。")]
     public Task Motion(string option, double? seconds = null)
@@ -129,7 +143,7 @@ public class DeskPetService(
             }
             if (!found || string.IsNullOrWhiteSpace(hit.Phrase))
                 throw new Exception("未知的生成式词条「" + key + "」。可用：" + GenPhrasesText());
-            BodyActPromptCore(hit.Phrase);      // 走「具身动作」开关与同一条生成链路（失败由前端退回）
+            BodyActPromptCore(hit.Phrase, seconds);      // 走「具身动作」开关与同一条生成链路（失败由前端退回）；seconds 可拉长生成
             return Task.CompletedTask;
         }
 
@@ -240,6 +254,7 @@ public class DeskPetService(
 
         // 具身表情工具同理：开启才注册（走 VRM 自带表情权重，不吃模型/显存，只是每轮多一点 token）
         pet.EmbodiedExpressionChanged += RegisterEmbodiedExpressionHandler;
+        pet.BodyExpressDocChanged += RegisterEmbodiedExpressionHandler;
         RegisterEmbodiedExpressionHandler();
 
         messageFilterService.AddMessageReplyRule(new MessageReplyRule {
@@ -262,15 +277,18 @@ public class DeskPetService(
         string motions = pet.SupportedMotions.Length == 0 ? "当前不支持" : string.Join(", ", pet.SupportedMotions);
         string models = pet.AvailableModels.Length == 0 ? "无" : string.Join(", ", pet.AvailableModels);
 
+        string exprHint = pet.EmbodiedExpressionEnabled
+            ? "- ★ 情绪表情**优先**用 `<bodyexpress emotion=\"happy\" intensity=\"0.8\" hold=\"5\"/>`（真实面部驱动，24 种情绪，吃 VRM 表情权重）；`<bodystate/>` 查实际渲染。下面 `Expression option` 是旧的表情名接口（兜底，别优先）。\n"
+            : "";
         handler = new XmlHandler(this) {
-            Description = "此服务让你获得一副可交互的 3D 桌宠身体（VRM / PMX+VMD）。这是你主要的对外输出表情动作等外观信息的工具，需要积极使用。",
+            Description = "此服务让你获得一副可交互的 3D 桌宠身体（VRM / PMX+VMD）。这是你主要的对外输出表情动作等外观信息的工具，需要积极使用。需要详细说明时先输出 <DeskPetService/> 读取；随后用 <bodyexpress/>（情绪表情）、<bodyact/>（具身动作）、<Expression/> / <Motion/> 调用。",
             Explanation = $"""
                            ## 支持选项
                            - 当前模型：{pet.CurrentModel}
                            - 支持的 {nameof(Expression)} 选项：{expressions}
                            - 支持的 {nameof(Motion)} 选项：{motions}
                            - 可切换的模型：{models}
-
+                           {exprHint}
                            注意：{nameof(Expression)} / {nameof(Motion)} 的 option 只能从上面列出的选项里选。
                            seconds 只对{nameof(Expression)}有意义（保持多久后收回）：
                            - 不填：表情 5 秒后自动收回默认
@@ -281,7 +299,14 @@ public class DeskPetService(
                              填短秒数会正好截断在没内容的那段。只有想让它多循环一会儿（跳舞/待机）才填，且要 ≥15。
                            """
         };
-        functionService.RegisterHandler(handler, cancellationToken: DestroyCancellationToken);
+        // ★ P0-B：改隐式文档 —— 常驻只注入一行描述，完整文档由模型需要时用 <DeskPetService/> 读取。
+        //   旧默认 Explicit 会把“表情/动作/模型清单 + 全部说明”每轮重复注入（日志实测 Input≈30.7k）。
+        functionService.RegisterHandler(handler, DocumentMode.Implicit, DestroyCancellationToken);
+        try
+        {
+            AlifeLog.LogInformation($"[3D桌宠] 提示词体积：常驻 {BuildModelInfoText().Length} 字符｜主工具文档 {handler.Document().Length} 字符（Implicit）");
+        }
+        catch (Exception e) { AlifeLog.LogWarning("[3D桌宠] 提示词体积统计失败: " + e.Message); }
     }
 
     /// <summary>按「具身动作」开关注册/注销 AI 的 bodyact 工具（关闭时完全不注册 → 不占 token）。</summary>
@@ -294,71 +319,65 @@ public class DeskPetService(
 
             embodiedHandler = new XmlHandler(new BodyActHost(this))
             {
-                Description = "用关键帧 JSON 驱动 3D 身体的「具身动作」（在预置动作之外自由编排动作）。",
+                Description = "用关键帧 JSON 驱动 3D 身体的「具身动作」（在预置动作之外自由编排动作）。先输出 <BodyActHost/> 读取完整通道/配方，随后用 <bodyact .../> 调用。",
                 Explanation = """
                     ## 具身动作（bodyact）
-                    在预置动作之外，用**关键帧 JSON** 自由编排身体动作。角度单位 = **度**。
-                    通道是**解剖学语义**，旋转轴由引擎按当前模型的真实骨骼朝向自动推导：
-                    **正数一律 = "抬起来 / 往身前 / 往身体外侧"**，左右正负你不用算、也不用管模型朝向。
+                    在预置动作之外，用**关键帧 JSON** 自由编排。角度单位=度；**正数一律=抬起来/往身前/往身体外侧**
+                    （左右正负不用算）。通道是解剖学语义，旋转轴由引擎按当前模型的真实骨骼朝向推导。
 
-                    ## 可用通道（**每个关节都有完整的三个自由度**：自转 + 两向摆动，肢体主轴可给到 ±180°）
-                    命名规律：`l`=左 `r`=右；`Up`=抬、`Fwd`=往身前摆、`Side`=往身体外侧、`Twist`=绕自身长轴自转。
-                    - lArmUp / rArmUp            上臂抬起（正数=抬高）
-                    - lArmFwd / rArmFwd          上臂往身前摆
-                    ⚠ lArmTwist / rArmTwist（上臂自转）**已实测无效，不要写**：VRM 归一化骨只保留"骨骼朝向"，
-                      绕自身长轴的自转分量会被丢弃（内置动作里给过 ±52 也毫无变化）。
-                      想调掌心/肘尖朝向，用下面的 ElbowSide（可靠）或 HandTurn（实测可用）。
-                    - lElbow / rElbow            屈肘（小臂往身前折，正数=折起来）
-                    - lElbowSide / rElbowSide    小臂往身体外侧摆（★挥手/摆手用这个，±25~30 就够；左右两侧都要写）
-                    - lElbowTwist / rElbowTwist  前臂自转（**尚未证实有效**，用了没变化是正常的，别反复调它）
-                    - lHandTurn / rHandTurn      手腕转掌（实测可用）
-                    - lHandBend / rHandBend      手腕下压 / 上翘
-                    - lHandSide / rHandSide      手腕左右偏
-                    - lShoulderUp / rShoulderFwd 耸肩 / 含胸展肩（**左右两侧都有**：rShoulderUp / rShoulderFwd 同样可用；
-                                                  只写一侧会出现"两个肩膀不一样高")
-                    - headPitch / headYaw / headRoll      点头 / 转头 / 歪头
-                    - spinePitch / spineYaw / spineRoll   躬身 / 转身 / 侧弯
-                    - chestPitch / chestYaw / chestRoll   上胸同上
-                    - hipsPitch / hipsYaw / hipsRoll      **动胯 = 骨盆相对腿**：上身跟着前倾 / 转 / 侧倾，腿脚留在原地。
-                                                          （它不是"把整个人当一块转"——那种整体位姿不在这张表里，别用这几个通道去凑）
-                    - lLegFwd / rLegFwd          大腿往身前抬（正数向前；负数向后，也就是迈步）
-                    - lLegSide / rLegSide        大腿向侧开（劈叉方向）
-                    - lLegTwist / rLegTwist      大腿自转（脚尖朝里 / 朝外）
-                    - lKnee / rKnee              屈膝（正数=小腿往后折，和真人一样，不是反关节）
-                    - lAnkle / rAnkle            勾脚 / 绷脚尖
-                    - lAnkleSide / rAnkleSide    脚内外翻
-                    - lToes / rToes              脚趾翘起（重心前移的感觉）
+                    ★★ **一次回复只发一条 bodyact**：连续/并行动作必须写进同一条 spec 的多个 steps（同一时间段里多个通道一起给），
+                    不要拆成多条调用——每条都会先播完并回站姿，中间会出现明显空档（用户实测“一条一条执行、很生硬”）。
+                    “并行”= 同一个 step 里同时给多个通道（手臂 + 脊柱 + 头），不是等一个动作做完再做下一个。
+                    拥抱直接用预设 hug：它已经包含“前伸 → 收拢 → 保持 → 回位”，**不要再补一条交叉双臂动作**；想更紧就在同一 spec 里加一步。
 
-                    ### 常用「反馈动作」配方（**照着改数就行，别从零猜角度**）
-                    下表每一行的角度都**取自内置预置的同款实测数值**（bow / nod / shake / shrug / stretch /
-                    hands_up / reach_fist）—— 同一套轴、同一套符号（正=抬/前/外，负=沉/后），不会歪。
-                    用法：一拍就是 `{"pose":{...},"dur":0.5,"ease":"inout"}`；引擎会**自动补"回到自然姿势"**，
-                    所以通常只写"去"的那一拍。想让"回正"更从容就显式再写一拍（dur 0.5 左右）。
+                    ## 通道（l=左 r=右）
+                    肩: l/rShoulderUp(耸肩)  l/rShoulderFwd(含胸/展肩)
+                    上臂: l/rArmUp(0垂/30稍抬/90侧平/150过头；**横向张开手臂用它，别用 ElbowSide 硬掰**)  l/rArmFwd(±30明显,±55夸张)  l/rArmIn(水平内收：拥抱往前伸时 10~25；35+ 会抱到自己胸口)
+                    肘: l/rElbow(**只能 0~145 的正数**：0直/40自然/70手到身前/90+紧收；负数=反关节，会被夹到 0)
+                        l/rElbowSide(只是 ±35 以内的"摆手"微调，**不能拿它当屈肘**；写大=小臂横着掰断)
+                    腕: l/rHandTurn(转掌，±85)  l/rHandBend(压/翘，-55~70)  l/rHandSide(±25)
+                    ⚠ `l/rArmTwist`、`l/rElbowTwist` 实测无效，不要写（掌心朝向用 HandTurn，别超过 ±85）。
+                    头/腰/胸/胯: head|spine|chest|hips + Pitch(点头/躬身) Yaw(转) Roll(歪/侧弯)
+                    胯(hips*) = 骨盆相对腿（腿钉原地，≤±35°）；大幅转身用 `turn`（整身连脚一起转）。
+                    腿: l/rLegFwd(正=前抬,负=后摆)  l/rLegSide(±75, 横向开腿/大步)  l/rLegTwist  l/rKnee(**只能 0~150 的正数**，负=反膝会被夹到 0)
+                        l/rAnkle(勾脚)  l/rAnkleSide(内外翻)  l/rToes(翘趾)
+                    ⚠ **关节硬约束**：肘/膝/腕/肩/腿都有生理范围（引擎最后一道闸会夹住并写日志），
+                      别用"大幅度硬转"去凑姿势；尤其**肘只能屈、膝只能后折**，写反了画面就是手臂折断。
+                    高层参数（**写在 step 层，不要塞进 pose**）：crouch(0~1 蹲；1≈膝97°/下沉0.41m 深蹲)  rootY(±0.6 胯升降)  kneel(0~1 跪；1≈膝74°/下沉0.44m 膝触地)  turn(±720, 360=转一圈, 顶层)  repeat  chain  overlay
 
-                    | 想表达 | 通道搭配（单位=度） | 节奏 |
-                    |---|---|---|
-                    | 欠身 / 鞠躬致意 | spinePitch=35, chestPitch=12, headPitch=12, lArmUp=rArmUp=12 | 去 0.55s `inout`，回 0.55s |
-                    | 只是"示意"的小欠身 | 上列各值 ×0.4（spinePitch≈14, headPitch≈5） | 去 0.35s `inout` |
-                    | 认真点头（两下） | headPitch=18 → -4 → 18 → 0 | 每拍 0.25s `inout` |
-                    | 摇头（否定 / 无奈） | headYaw=20 ↔ -20 | 每拍 0.22s，顶层 `"repeat":2` |
-                    | 歪头（疑惑 / 卖萌） | headRoll=14, headYaw=6 | 0.35s `out` |
-                    | 缩肩 / 不好意思 | lShoulderUp=rShoulderUp=20, headPitch=10, headRoll=8 | 0.35s `out` |
-                    | 耸肩（"谁知道呢"） | lArmUp=rArmUp=30, lElbow=rElbow=45, headRoll=8 → -8 → 8 | 每拍 0.35s（= 内置 shrug 原值） |
-                    | 挺直 / 精神一振 | spinePitch=-8, headPitch=-10, lShoulderUp=rShoulderUp=14 | 0.4s `out`（负数=后仰/抬头，stretch 验证过） |
-                    | 泄气 / 蔫下去 | spinePitch=28, chestPitch=10, headPitch=16, lShoulderUp=rShoulderUp=-12 | 0.6s `inout`（肩负值=沉肩） |
-                    | 伸手（递东西 / 解释） | rArmUp=84, rArmFwd=10, rElbow=26, rElbowSide=4, rHandTurn=-16, chestYaw=-5 | 0.62s `inout`（= 内置 reach_fist 抬起段） |
-                    | 双手举起（欢呼 / 投降） | ① 起手甩开：lArmUp=rArmUp=58, lArmFwd=rArmFwd=14, lElbow=rElbow=42
-                      ② 举过头：lArmUp=rArmUp=146, lElbow=rElbow=22, lElbowSide=rElbowSide=8
-                      ③ 到位余势：lArmUp=rArmUp=152, lElbow=rElbow=32 | 0.34s + 0.32s + 0.18s（=内置 hands_up）
-                      ⚠ 别只写 `lArmUp=rArmUp=150` 一个值 —— 那是旧版，手臂会像根棍直上直下 |
-                    | 侧身让开 / 看别处 | turn=40, headYaw=20（turn=整体转身，脚也跟着转） | 0.45s `inout` |
+                    ### 基础姿势（不是动作）
+                    - 坐下/坐好 → Pose 工具 option=sit_full（全身坐，腿可见）；坐到任务栏 → sit（只显示上半身）；
+                      站起来 → stand；躺下 → lieback。
+                    - **不要用 bodyact 的 crouch/kneel 代替“坐下”**：crouch 是蹲，不是坐。
+                    - 具身动作引擎会自动补：肘跟随、腕自然翘、抬臂掌心朝向、胸腔/头部联动、单侧发力时的重心微倾；
+                      写动作时不用重复这些，**同一条动作至少要有一处停顿/空段**，不要所有段都匀速。
 
-                    **写顺动作为的硬规则（都踩过坑，务必遵守）**：
-                    1. **一个连续动作写成一段**：别把"抬一半 → 做别的 → 继续抬"拆成两段 —— 每段都会各自
-                       "加速→减速到 0"，两段之间必然"刹一下再起步"（实测观感很怪）。
-                    2. 需要"停一拍"就用**空段**：`{"dur":0.4}`（只有 dur、不写 pose），别靠相邻两段都减速去凑。
-                    3. 相邻段一律 `ease:"inout"`；引擎还有 `smooth:0.3` 的跨段低通兜底（`"smooth":0` 可关）。
-                    ⚠ 这些是"素材里没有的**小反馈**"。要造型类（比心 / 叉腰 / 抱臂）照旧走 `<motion>` 或请用户摆。
+                    ### 常用配方（角度取自内置预置实测值；照抄改数，别从零猜）
+                    一拍 = `{"pose":{...},"dur":0.5,"ease":"inout"}`；引擎会自动补"回自然姿势"，通常只写"去"的那拍。
+                    - 鞠躬: spinePitch35 chestPitch12 headPitch12 lArmUp=rArmUp12；0.55s inout
+                    - 拥抱: 直接用 preset="hug"；自由编排必须 ArmFwd 75~90（往前伸）+ **ArmIn 10~25**（只轻轻收拢）+ Elbow 35~60
+                    - **幅度底线**：拥抱/挥手/伸手/指这类表达动作，主通道别写 10~20°（画面几乎看不出）；
+                      挥手 ArmUp≥90、伸手 ArmFwd≥55、拥抱 ArmFwd≥75 且 ArmIn 10~25；小角度只用于微调。
+                      （只写 ArmFwd 手臂会停在身体两侧，抱不拢 = “只往前伸一点点”）
+                    - 小示意: 上列×0.4；0.35s
+                    - 点头两下: headPitch 18→-4→18→0，每拍0.25s
+                    - 摇头: headYaw 20↔-20，每拍0.22s，`"repeat":2`
+                    - 歪头: headRoll14 headYaw6；0.35s out
+                    - 缩肩/不好意思: lShoulderUp=rShoulderUp20 headPitch10 headRoll8；0.35s out
+                    - 耸肩: lArmUp=rArmUp30 lElbow=rElbow45 headRoll8→-8→8；每拍0.35s
+                    - 挺直/精神一振: spinePitch-8 headPitch-10 lShoulderUp=rShoulderUp14；0.4s out（负=后仰/抬头）
+                    - 泄气: spinePitch28 chestPitch10 headPitch16 lShoulderUp=rShoulderUp-12；0.6s inout
+                    - 伸手: rArmUp84 rArmFwd10 rElbow26 rElbowSide4 rHandTurn-16 chestYaw-5；0.62s inout
+                    - 双手举起: ①ArmUp58 ArmFwd14 Elbow42 ②146/22/ElbowSide8 ③152/32；0.34+0.32+0.18s
+                      ⚠ 别只写 ArmUp=150 一个值（旧版，手臂像棍直上直下）
+                    - 侧身让开: turn40 headYaw20；0.45s inout
+                    - 挥手: ArmUp70~90 Elbow30 → ElbowSide ±25~35 来回两次 → 收手
+
+                    **硬规则**
+                    1. 一个连续动作写成**一段**；拆两段会"刹一下再起步"。要停顿用空段 `{"dur":0.4}`。
+                    2. 相邻段一律 `ease:"inout"`；别写 `linear`（匀速=机械）。
+                    3. 大臂先动 → 小臂跟上（**肘必须变**）→ 指尖；同一根骨至少变两次，全程一个值=棍。
+                    4. 接触型（敬礼/扶帽/摸脸）末段留空段保持；大臂 ArmFwd 20~30，否则手够不到。
 
                     ### 活人感：引擎自动把动作"铺开"到整条脊柱（**你不用管**）
                     真实人体的转动是分散在多节骨骼上的，所以引擎会自动分摊：
@@ -368,205 +387,95 @@ public class DeskPetService(
                     **你只管写"意图通道"**（头 / 腰 / 手 / 腿）—— 颈、上胸这类是引擎内部通道，不对外开放。
                     想要**刻意的机械 / 僵直 / 木偶感**（比如演一个机器人、或者生气时绷住）：spec 里加 `"link":0` 关掉联动。
 
-                    ### 蹲 / 跪（**不用手调膝盖**：给一个数，双腿自动解算）
-                    这两个是"高层参数"，不是通道。给了它，**双腿的腿/膝/踝由解析 IK 算出来**：
-                    「骨盆降到哪」和「膝屈多少」是同一个三角形的两个量，必须联立解，手调一定对不上
-                    （这就是"单弯膝脚会离地、单降骨盆会悬空"的原因）。解完脚会自动踩在原地。
-                    - `"crouch": 0.6`  下蹲（0~1：站 → 蹲到底）。降低重心、蹲着说话/捡东西用它。
-                      ⚠ **刻度已按踝背屈极限（32°）标定**：crouch=1 = 「脚跟不离地能蹲到的最深」。
-                      写更大的值也不会更深（会被夹到极限）。
-                      ⚠ **下面所有「cm」都是按开发机模型（腿长约 0.8 单位）算的，会随模型腿长变化** ——
-                        只把 cm 当**量级参考**（几厘米 / 十几厘米 / 二十几厘米），膝屈的**度数才是跨模型通用的**。
-                      想要"更深/更夸张"的姿势得靠**空中收腿**等手段，别指望 crouch。
-                    - `"kneel": 1`     跪下（0~1：站 → 双膝跪地：膝触地、小腿放平、脚尖点地）。
-                    例：<bodyact spec='{"crouch":0.7,"steps":[{"pose":{"headPitch":10,"spinePitch":8},"dur":0.5}]}'/>
-                    ⚠ 给了 crouch/kneel 就**别再手写** lKnee/rKnee/lAnkle —— 那几个会被自动值覆盖（写了不生效）。
-                    ⚠⚠ 蹲/跪**也不要**用 `<bodyact prompt>` 去生成：本地生成模型没有地面/接触/IK 概念，
-                    它生成的 squat 是**健身宽站蹲**（两腿向两侧岔开成马步 + 跨步、根位移忽上忽下），完全不像蹲
-                    （squat 类词条已全部列进词表的 rejected，实测证伪）。蹲跪只有 crouch/kneel 这一条路。
+                    ### 蹲 / 跪（不用手调膝盖）
+                    `crouch` 0~1（0站→1最深，按踝背屈 32° 标定，再大也不更深）；`kneel` 0~1（膝盖触地）。
+                    ⚠ 这两个是**段参数**：写在 step 层（`{"crouch":0.7,"dur":0.5}`），**不要放进 pose**。
+                    给了 crouch/kneel，腿/膝/踝由引擎 IK 解算；**别再手写** lKnee/rKnee/lAnkle（会被覆盖）。
+                    膝屈参考：crouch 0.3≈26° / 0.6≈44° / 1≈62°（下沉厘米数随模型腿长变，别照抄）。
+                    
+                    例: <bodyact spec='{"crouch":0.7,"steps":[{"pose":{"headPitch":10,"spinePitch":8,"lArmFwd":18,"rArmFwd":18,"lElbow":32,"rElbow":32},"dur":0.5}]}'/>
+                    ⚠ 蹲下时**手臂一定要跟着给一点**（ArmFwd 15~25 + Elbow 25~40）；只写 crouch + 头/腰 = 木偶下蹲（很生硬）。
+                    ⚠ 蹲/跪**不要**用 prompt 生成（模型没有地面概念，会出健身宽站蹲）。
 
-                    ### 跳 / 蹦（三档预置 —— **别什么场合都跳同一个**）
-                    - `jump`（轻快蹦，≈1.05s）：浅蓄力（膝 ~66°）→ 弹起 → 滞空 → 落地轻缓冲。
-                      用在：小开心、轻快回应、给"嗯！"换个花样。
-                    - `jump_power`（全力深蹲跳，≈1.6s）：**动漫式深蹲**（膝屈 ~135°、胯降约为腿长的 0.4 倍，脚跟贴屁股）
-                      → 手臂后收再上甩 → 弹起 → 滞空 → 落地深缓冲。用在：特别兴奋、庆祝、"终于做到了"。
-                    - `jump_joy`（欢呼跳，≈1.4s）：双臂高举着跳。用在：被夸 / 被加油 / 想被注意。
-                    - 手写版（真要改高度/节奏时）：**每段都能给 `rootY`（胯的实际升降，±0.6 世界单位）
-                      与 `crouch`（腿部弯曲 0~1；注意**只写 crouch 不写 rootY 时，胯会自动跟着腿部解算一起下沉**）**，
-                      段内按 ease 插值、不写就沿用上一段：
-                      例：<bodyact spec='{"steps":[{"crouch":0.9,"dur":0.42,"ease":"out"},{"rootY":0.3,"crouch":0.05,"dur":0.18,"ease":"in"},{"rootY":0.34,"crouch":0,"dur":0.22,"ease":"inout"},{"crouch":0.78,"dur":0.26,"ease":"in"},{"crouch":0,"dur":0.3,"ease":"out"}]}'/>
-                      要点：**下压慢（0.3~0.45s）、弹起快（`ease:"in"`）、顶点只留一瞬、落地再压一次浅缓冲**才像跳；
-                      crouch 深浅参考（已按踝背屈极限标定）：0.3≈膝 26°、0.6≈膝 44°、1.0≈膝 62°
-                      （下沉的**厘米数随模型腿长变**，不要照抄；膝屈度数才是通用的）。
-                      ⚠ 腾空段的 rootY 别给到 0.5 以上（会像飞）；也别连跳，一次就够。
-                    - **动漫式"跳起来收腿"**（膝盖大幅弯曲、脚跟贴近屁股）只能**手写腿部通道**（空中腿不受地面约束）：
-                      `{"lLegFwd":52,"lKnee":100,"lAnkle":22,"rLegFwd":50,"rKnee":96,"rAnkle":22}` = 提膝 + 小腿折叠 + 勾脚。
-                      要点：**先蹬直（写 0）→ 腾空收 → 下落伸出去**，三段连起来才有动漫感（现成范例就是 `jump_power` 预设）。
-                      腿部通道速查：`lLegFwd/rLegFwd`（大腿前摆＝提膝，正＝向前上）、`lKnee/rKnee`（屈膝，正＝小腿往后折）、
-                      `lAnkle/rAnkle`（勾脚，正＝脚尖翘）；`×Side` 系列管外展。
-                      ⚠ **只在腾空段写**（那时蹲/跪解算不接管）；蓄力/落地段的腿由 crouch 自动解算，手写会被覆盖。
+                    ### 跳 / 蹦（优先用预置，别什么场合都跳同一个）
+                    `jump` 轻快≈1.05s｜`jump_power` 全力深蹲跳≈1.6s｜`jump_joy` 欢呼跳≈1.4s｜`jump_x2` 连蹦两下。
+                    手写跳：每段可给 `rootY`(±0.6) 与 `crouch`；**下压慢(0.3~0.45s)、弹起快(ease:"in")、顶点一瞬、落地浅缓冲**。
+                    腾空收腿只写腿通道（`lLegFwd52 lKnee100 lAnkle22` …），蓄力/落地段别写（由 crouch 接管）。
 
-                    ### 自己编动作：按"真人规律"排，**数值你自己定**（比用预置更自由）
-                    你本来就能写任意通道 —— 缺的只是"动作学常识"。照下面的**阶段规律**排，
-                    数值按幅度感觉给（括号里是常见量级，可超可减）：
+                    ### 自己编动作
+                    量级见上面的通道表与配方；不确定就先用预置起步（`preset`），再改一两处关键通道。
+                    节奏：`dur` 0.15~0.35s 最自然；单步 ≤4s、整段总时长 ≤8s（超了会被前端截断）。
+                    需要长时间保持姿势不要写 40s 的 dur —— 用造型面板/静态造型，或分段续接。
 
-                    **手臂通道速查**（"像不像活人"最关键的一组）：
-                    - `lArmUp/rArmUp` 抬臂（0 = 垂在身侧，+30 稍抬，+90 与肩平，+150 高举过头）
-                    - `lArmFwd/rArmFwd` **前后摆**（正 = 往身前，负 = 往身后；±30 明显，±55 很夸张）
-                    - `lElbow/rElbow` 屈肘（0 = 伸直，40 = 自然弯，70 = 手收到身前，90+ = 紧收）
-                    - ⚠ `lArmTwist/rArmTwist` 上臂自转**无效（写了没变化），不要用**；掌心朝向改用 rHandTurn/lHandTurn
-                    - `lElbowSide/rElbowSide` 小臂外摆（挥手主要靠它；**左右两侧都要写**，只写一侧会两边不一样）
-                    - `lHandTurn/lHandBend/rHandTurn` 手腕转掌 / 压翘
+                    ### 接触型姿势（敬礼 / 扶帽 / 摸脸）
+                    惯性会让末端"甩过头"：末段接一个**空段**（`{"dur":0.30}`，无 pose）停住即可贴稳；
+                    大臂给一点 `ArmFwd` 20~30° 才够得到额头；要更稳可 `{"preset":"salute","inertia":0.3}`。
+                    肘范围：0直/45自然/90手到胸前/120+敬礼（本机可到 145°）。
 
-                    **动作配方**（阶段 → 该动的通道；数值自己给）：
-                    - **跳**：① 蓄力：`crouch` 0.5~0.9（腿自动蹲）+ `spinePitch` 前倾 + **手臂后摆
-                      （`ArmFwd` −40~−55）+ 屈肘 65~85**；② 蹬地（`ease:"in"`）：`rootY` 抬升 + 手臂
-                      **前上甩开**（`ArmFwd` +30、肘伸到 20~25）；③ 腾空：`rootY` 峰值 + 手臂上举、肘微屈 30
-                      + 收腿（`lKnee` 90~110）；④ 下落：肘再屈 45~55；⑤ 落地缓冲：**肘 60~75 + `crouch` 0.4~0.5**。
-                    - **挥手**：抬臂到与肩平（`ArmUp` 70~90、`Elbow` 30）→ **小臂左右摆**（`ElbowSide` ±25~35，
-                      来回两次）→ 收手。
-                    - **鞠躬**：`spinePitch` 30~40 + `chestPitch` 10~15 + 头随（`headPitch` 10）
-                      + **手臂被动后让**（`ArmFwd` −8~−15、`Elbow` 10~20）；起身反向。
-                    - **欢呼**：双臂高举（`ArmUp` 140~158）+ 肘微屈 24~34 + 身体微后仰（`spinePitch` −5），可叠跳。
-                    - **耸肩 / 摊手**：`ShoulderUp` 15~25 + `Elbow` 40~50 + 手腕外翻（`HandTurn`）。
-                    - **伸手拿 / 递东西**：`ArmFwd` +50~70 + `Elbow` 20~30 + 手型（`fingers`）配合。
-                    **通用心法**：**大臂先动 → 小臂跟着（肘必须有变化）→ 最后指尖**；同一根骨在一个动作里
-                    "至少变两次"（出去、再回来一点）才像活人 —— **全程一个值 = 棍**。
-                    不确定就先用预置起步（`preset`），再改一两处关键通道。
-                    ⚠ **别写 `"ease":"linear"`**（匀速 = 机械；引擎的"惯性甩动"要靠**加减速**才看得出来）。
-                    不写 ease 就默认 `inout`；要在**段末**有冲劲儿用 `"in"`（加速收尾）、要稳稳停住用 `"out"`。
-                    段落也别太长：0.15~0.35s 一段最容易出"活人感"，0.6s 以上的匀速段一定显僵。
+                    ### 连招（一次回复里的多条 bodyact 会按顺序播）
+                    默认每条末尾回自然姿势；想让前一条的结束姿势留给下一条，加 `"chain":true`。
+                    例：`<bodyact preset="jump" spec='{"chain":true}'/>` ＋ `<bodyact preset="jump"/>`。
+                    预置与 spec 会合并（spec 字段覆盖预置）⇒ 等于"基于预置改一点"。
 
-                    ### 大幅屈肘 / 接触型姿势（敬礼、扶帽、摸脸、捏东西 —— 手要**贴住**某处）
-                    这类动作有个新坑：**惯性偏移会让末端"甩过头"**（角偏移在末端会放大成几厘米的位移）。
-                    三条做法（现成范例：`<bodyact preset="salute"/>` 敬礼）：
-                    1. **末段留一个空段保持**：`{"pose":{…},"dur":0.32}` 之后接 `{"dur":0.30}`（无 pose）——
-                      **停住 ⇒ 速度/加速度项同时归零 ⇒ 偏移消失**，手自然贴稳；
-                    2. 大臂记得**往前给一点**（`ArmFwd` 20~30°），否则肘弯了手也够不到额头；
-                    3. 还想更精确：`{"preset":"salute","inertia":0.3}`（`inertia` 0~1 缩放整条动作的惯性，0=不用）。
-                       —— 引擎已经会自动把"肘弯过 95° 时的手/小臂偏移"压到 60%，一般不用你操心。
-                    **肘的可用范围很大**：0=伸直、45=自然弯、90=手到胸前、120+=敬礼/扶帽（本机模型能到 145°）。
+                    ### 整体转身
+                    `"turn": 360`（±720，正=往角色左边；360=原地转一圈，180=背对观众）—— 转的是**整个模型**（含脚）。
+                    动作开始时逐渐转过去（180°≈1.1s、360°≈2.2s），结束时沿**最短路径**慢慢回正；
+                    整圈（360°）结束等价于原朝向 ⇒ 不会"转一圈再倒着转回来"。
+                    大幅转身用 turn；只有骨盆/上身转、脚不动才用 hipsYaw（≤±35°）。
 
-                    ### 连招 / 编排：**连不连、怎么连，你自己定**（不用问用户）
-                    宿主会**按顺序播**你一次回复里的多条 `<bodyact>`。默认每条末尾都"回到自然姿势"（所以是"一下、一下"）；
-                    想让几条连成一套，就给**前面**的加 `"chain":true`（末尾不回中性，结束姿势留给下一条接上）：
-                    - 连蹦两下：`<bodyact preset="jump" spec='{"chain":true}'/>` ＋ 再一条 `<bodyact preset="jump"/>`
-                      （预置与 spec 会**合并**，spec 里写的字段覆盖预置 ⇒ 这就等于"基于预置改一点"）
-                    - 跳完接欢呼：`<bodyact preset="jump_power" spec='{"chain":true}'/>` ＋ `<bodyact preset="jump_joy"/>`
-                    - 现成的两连蹦：`<bodyact preset="jump_x2"/>`（跳 → 浅缓冲 → 再跳 → 落地 → 回站，中途不站定）
-                    - 也能连别的：挥手 → 鞠躬、伸手 → 握拳 → 放下……凡"有延续关系"的都行
-                    什么时候**别**用：两条动作彼此独立，或你希望中间有个明确的"站定"停顿时 —— 那正是回中性的价值。
-                    原则：**预置只是省事的起点**。你可以自己写关键帧（spec）、用 overlay 叠加、用 chain 串起来 ——
-                    怎么演，由你按当下的情绪和场景决定，不必等用户来指定。
+                    ### 手型（fingers）
+                    `"fingers":{"l":"fist","r":"spread"}`；手型名：open / relaxed / half / fist / spread / point / thumb_up / victory。
+                    逐指：`{"r":{"curl":100,"index":0}}`；拇指另有 `thumbBase/thumbTip`(0~250)、`thumbSide`(±150)、`thumbRoll`(±180)。
+                    比心 / OK 这类精细造型别硬凑：先翻「可用动作」列表，没有就请用户摆好后存预设。
 
-                    ### 整体转身（大幅转身 / 背对观众）
-                    `"turn": 150`（度，±180；正的=往角色自己的左边转）—— 转的是**整个模型**（含脚一起转）。
-                    - 想背对观众/躲开/转身看别处：`<bodyact spec='{"turn":180,"steps":[...]}'/>`
-                    - ⚠ **别用 hipsYaw 去凑大幅转身**：hipsYaw 的语义是「骨盆相对腿」（腿钉在原地），
-                      只能小角度（≤±35°）；拧到 90° 以上就是把胯相对腿拧死（反关节、会穿模）。
-                      判断法：**腿脚要跟着一起转 → turn；只有骨盆/上身转、脚不动 → hipsYaw**。
-
-                    ### 手型（手指：握拳 / 张开 / 指人 / 竖拇指 / 剪刀手）
-                    `"fingers": {"l":"fist","r":"spread"}`
-                    - 左右手各自给一个**手型名**，或给逐指数值：`{"r":{"curl":100,"index":0}}` = 右手握拳但食指伸直；
-                    - 手型名：open(摊平) / relaxed(自然半握) / half(半握) / fist(握拳) / spread(五指张开)
-                              / point(指人) / thumb_up(竖拇指) / victory(剪刀手)；
-                    - **拇指是「球窝 + 两个铰链关节」，比四指多几档**（四指只有"卷 + 张开"）：
-                      `thumbBase` 0~250 = **近节（根部关节）屈**；`thumbTip` 0~250 = **末节（指尖关节）屈**
-                        —— 250 = 该节满屈，尺度由本模型自标定，**你别猜**；也可只写 `thumb`（两节同值，老写法兼容）；
-                      `thumbSide` ±150 = 内收/外展（**正 = 离开掌心张开**；负 = 往掌心里收）；
-                      `thumbRoll` ±180 = 绕拇指自身长轴**拧**（只改掌面朝向、**不产生弯曲**，对掌时调朝向用）。
-                      例：`{"r":{"thumbBase":250,"thumbTip":250,"thumbSide":-60}}` = 拇指两节都弯满并收进掌心（像握拳）。
-                      ⚠ 但"捏 / 对掌 / 比心"这类**精细造型仍然别自己硬凑** → 让用户去造型面板摆（拇指有 4 个滑块）。
-                    - 想"举拳呐喊"就叠加：`{"overlay":{"base":"hands_up","add":{"fingers":{"l":"fist","r":"fist"}}}}`；
-                    - ⚠ 比心 / OK 这类**精细造型**按这个顺序解决，别自己硬凑（要逐指精细角度，硬写一定走形）：
-                      ① **先翻常驻信息里的「可用动作」列表**看有没有现成的（比心/握手/鼓掌这类常有现成文件）→
-                         有就直接 `<motion option="精确名字"/>`（名字一字不差，含斜杠）；
-                      ② 没有再让用户去造型面板摆好手势 → 存成预设 → 你之后用 `<bodyact preset="名字"/>`。
-
-                    ### 组合语法 overlay（把两段动作叠起来）
-                    `<bodyact spec='{"overlay":{"base":"wave","add":{"steps":[{"pose":{"headRoll":12},"dur":0.3}]},"amp":1.1,"tempo":0.8}}'/>`
-                    - `base`：预设名或一份 spec（打底）；`add`：叠在它之上的关键帧/参数（**不会把 base 吃掉**）；
-                    - `amp`：缩放叠加量（1.1=夸张些，0.5=含蓄一半）；`tempo`：改叠加部分的节奏（0.8=慢一档）；
-                    - 这是"同一个动作演出不同人格"的主力：预置挥手叠上歪头/抬肩/慢半拍就是另一个人。
+                    ### overlay（叠加）
+                    `{"overlay":{"base":"wave","add":{...},"amp":1.1,"tempo":0.8}}`：base=打底预设/spec，add=叠加关键帧，
+                    amp 幅度、tempo 节奏。同一动作演出不同人格的主力。
 
                     ## 用法
-                    <bodyact spec='{"steps":[{"pose":{"rArmUp":96,"rElbowSide":-12},"dur":0.45,"ease":"out"},{"pose":{"rElbowSide":30},"dur":0.2},{"pose":{"rElbowSide":-24},"dur":0.2},{"pose":{"rElbowSide":30},"dur":0.2}]}'/>
+                    <bodyact spec='{"steps":[{"pose":{...},"dur":0.45,"ease":"out"}, ...]}'/>
+                    - pose 只写要改的通道；未写保持上一段；末尾会自动回自然姿势（不用补收尾）。
+                    - 顶层可写 `repeat`。也可直接用预置：<bodyact preset="wave"/>。
+                    - 预置：wave / nod / shake / bow / hands_up / stretch / shrug / salute / reach_fist /
+                            jump / jump_power / jump_joy / jump_x2 / hug。
 
-                    - 每一步 `pose` **只写要改的通道**，未写的通道保持上一步的值；
-                    - `dur` = 本步用时（秒）；`ease` = linear | in | out | inout；
-                    - 顶层可选 `repeat`（整段重复几次）；**末尾会自动回到自然姿势**，你无需补收尾；
-                    - 也可直接用预设：<bodyact preset="wave"/>；
-                      预设：wave(挥手) / nod(点头) / shake(摇头) / bow(鞠躬) / hands_up(举手) / stretch(伸懒腰) / shrug(耸肩)
-                            / jump(轻快蹦) / jump_power(全力深蹲跳) / jump_joy(欢呼跳) / jump_x2(连蹦两下)；
+                    ## 生成式动作 prompt
+                    `<bodyact prompt="a person does jumping jacks"/>`：本地生成默认 80 帧@20fps（≈4s），零联网；gen: 词条加 seconds 可生成更长（上限 12s）。
+                    词条是**闭集**（见常驻信息「生成式动作词条」，只能照抄；换说法=抽盲盒）。
+                    「可用动作」没有、配方也表达不了时可用（站立小反馈最合适）；**不要**用于蹲跪/精细手指。
+                    结果不保证精确；不像就如实说明并改 preset，别反复重试同一条。
 
-                    ## 生成式动作 prompt（本地模型现场生成，**词条受限于下表**）
-                    `<bodyact prompt="a person raises the right hand high above the head and waves hello"/>`
-                    一句英文 → 本地模型现场生成 40 帧（@20fps ≈ 2 秒）→ 播放，**零联网、不吃 token**。
-                    它的文本理解很**粗**（语义向量模型，不是指令模型）：**只能从上表词条里挑，别自己造句**，
-                    换说法很可能生成出完全不相干的动作。
-                    **可用词条（实测有效）**：见**常驻信息**里「生成式动作词条」那一行
-                    （数据源 = 插件里的 ardy-phrases.json 的 verified 段：真机试跑通过一条就加一条）。
-                    ⚠ 这里**不再硬编码** —— 旧写法让白名单实际只有 1 条，AI 于是从不使用生成式。
-                    词条是**闭集**：只能照抄那一行里出现的标签/原句，别自己造句。
-                    **什么时候用（③ 已改成"优先"，不再是最后手段）**：
-                    当**「可用动作」列表里没有合适的文件、配方（preset / 关键帧）也表达不了**时，
-                    **首选 `gen:` 词条**（`<motion option="gen:举手挥手"/>`），而不是硬凑 spec 或干脆不动。
-                    典型场景：站立待机类小反馈（低头 / 抬头 / 环顾 / 轻微摆臂 / 敬礼 …）。
-                    **不要**用它做：蹲跪（走 crouch/kneel）、精细手指造型（走 `<motion>` 或请用户摆）。
-                    生成结果**不保证精确**，单次约 1 秒生成 + 2 秒播放；若画面没动或不像，**如实说明并改用 preset**，
-                    不要反复重试同一条。
+                    ## 造型类姿势（比心 / 叉腰 / 抱臂 / 耍帅）
+                    角度硬凑一定不像。顺序：① 先翻「可用动作」列表，有就直接 `<motion option="精确名字"/>`（一字不差）；
+                    ② 没有就请用户去「造型」面板摆好并保存，之后 `<bodyact preset="造型名"/>`；③ 都没有就如实说做不到。
 
-                    ## 造型类姿势（比心 / 叉腰 / 抱臂 / 耍帅 / 敬礼…）：**按顺序解决，别自己硬凑**
-                    这类姿势用角度硬凑是做不出来的：通道只到手腕、也没有 IK，
-                    而且造型必须"看着画面"调 —— 你凑出来的只会是不像的怪姿势（观感比不做更差）。
-                    正确顺序（**从上往下试，别跳步；第 0 步最容易漏**）：
-                    0. **先翻常驻信息里的「可用动作」列表**：那是磁盘上现成的动作文件（常含比心 / 握手 / 鼓掌 / 舞蹈…）。
-                       有对得上的就直接 `<motion option="精确名字"/>` —— 最省事、也最像（**名字一字不差，含斜杠**）。
-                       ⚠ **只能点清单里真实出现的名字，别照抄示例**：清单已按当前模型类型过滤过
-                       （VRM 只列 .vrma、PMX 只列 .vmd）—— 清单里没有的名字**一定播不了**（点了也是人不动）。
-                    1. 列表里没有，再**请用户**打开桌宠设置面板 →「造型」区 → 拖滑块摆好 → 填名字点「保存」；
-                    2. 之后你就能像用内置预设一样使用它：`<bodyact preset="造型名"/>`；
-                    3. 已有哪些造型会写在你的常驻信息里（"自定义造型：…"）。
-                    都没有：**如实说做不到**。
-                    - 例：<bodyact preset="nod"/> 会点头两次。
+                    ## 使用频率
+                    **不是每轮都动**。只有对话本身带情绪/动作意图时才用（打招呼/告别/道谢/被夸/被责备/明显开心难过/
+                    说到看、听、来、跳、走、挥手）。普通问答、解释、闲聊、技术讨论一律不要调用。
+                    每条回复**最多 1 个动作 + 1 个表情**。
 
-                    ## 使用频率（**最重要**：不要每轮都动）
-                    **不是每次回复都要调用**。只有对话内容本身带明确情绪或动作意图时才用：
-                    打招呼 / 告别 / 道谢 / 被夸 / 被责备 / 明显开心或难过 / 明确说到"看、听、来、跳、走、挥手"等动作词。
-                    **普通问答、解释说明、闲聊、连续的技术讨论一律不要调用** —— 保持安静才像真人。
-                    同一条回复里**最多 1 个动作 + 1 个表情**，不要每个分句都配动作；也不要为了"显得生动"而加。
+                    ## 对谁反应
+                    优先级：主人 > 群友；直接对我说 > 旁观。主人表达情绪 → **必须回应**（表情 + 匹配动作）；
+                    群友与我无关的闲聊 → 沉默；@我/评价我 → 反应但低一档；主人跟别人聊且与我无关 → 只给极轻表情，不摆动作。
 
-                    ## 对谁反应、用什么反应（多人 / 群聊场景）
-                    **优先级**：主人 > 群友；直接对我说 > 我在旁观。
-                    判断"有没有关"看三件事：**谁在说**（主人 / 群友）、**说给谁**（我 / 别人）、**内容是否关于我**。
-                    - **主人**说的话**默认都与我有关**（我是他的伙伴）。主人表达情绪（夸奖、鼓励、抱怨、累了、开心、
-                      羡慕、撒娇…）→ **必须回应**：一个表情 + 一个**与该情绪匹配**的动作（见下表）。
-                      这是"表达情绪"的必需项，**不是可选项**。
-                    - **群友之间与我无关的闲聊 → 沉默**（不发表情、不摆动作）；只有群友 @我 / 评价我 / 直接问我时才反应，
-                      且强度比主人**低一档**。
-                    - 主人只是在群里跟别人聊、内容与我无关时 → 可以给一个**极轻**的表情表示"我在听"，**不要摆动作**。
-
-                    ## 情绪 → 动作 对照（动作必须和情绪匹配，别乱配）
-                    | 情绪 | 表情 option | 动作 |
+                    ## 情绪 → 动作
+                    | 情绪 | 表情 | 动作 |
                     |---|---|---|
-                    | 被夸 / 开心 | happy | nod（点头）或 hands_up（举手小庆祝） |
-                    | 害羞 / 被夸得不好意思 | shy | 幅度要**小**：nod 后停顿，或干脆只留表情（害羞=少动更传神） |
-                    | 鼓励我 / 加油 | happy | hands_up 或 wave（挥手打气） |
-                    | 羡慕 | surprised 或 shy | 小幅歪头（nod 后停住），**不要大动作** |
-                    | 主人难过 / 需要共情 | sad | 缓慢 nod（低头）一两次，动作轻 |
-                    | 生气 / 被冒犯 | angry | shake（摇头） |
-                    | 撒娇 / 讨要 | shy | stretch（伸懒腰）或 nod，表情保持久一点 |
-                    | 惊讶 | surprised | 优先只表情，一般**不给动作** |
-                    | 特别兴奋 / 想被注意 | happy | 三档跳按情景选：轻快 `jump` / 用力 `jump_power`（深蹲式）/ 欢呼 `jump_joy`；别连跳 |
-                    **强度三档**：轻 = 只表情；中 = 表情 + 一个小动作；强 = 表情 + 明显动作。
-                    主人情绪明显 → 至少"中"；群友对我有情绪 → 最多"中"；旁观 → 无。
-                    **动作只能从"预置"（`<bodyact preset="…">`）或"动作列表"（`<motion option="…">`）里真实存在的选项里选**；
-                    没有贴切的就**只发表情** —— 宁缺勿编（编一个"差不多"的姿势观感更差）。
+                    | 开心 / 被夸 | happy | nod / hands_up |
+                    | 害羞 | shy | 只表情，或小幅 nod（少动更传神） |
+                    | 鼓励 | happy | hands_up / wave |
+                    | 羡慕 | surprised / shy | 小幅歪头，不要大动作 |
+                    | 难过 | sad | 缓慢 nod |
+                    | 生气 | angry | shake |
+                    | 撒娇 | shy | stretch / nod |
+                    | 惊讶 | surprised | 只表情 |
+                    | 特别兴奋 | happy | jump（轻）/ jump_power（用力）/ jump_joy（欢呼），别连跳 |
+                    强度：轻=只表情；中=表情+小动作；强=表情+明显动作。主人明显情绪至少"中"，群友最多"中"，旁观无。
+                    动作只能从真实存在的 preset / 动作列表里选；没有贴切的就只发表情（宁缺勿编）。
                     """,
             };
-            functionService.RegisterHandler(embodiedHandler, cancellationToken: DestroyCancellationToken);
-            AlifeLog.LogInformation("[3D桌宠] 已注册具身动作工具（bodyact）");
+            functionService.RegisterHandler(embodiedHandler, DocumentMode.Implicit, DestroyCancellationToken);
+            AlifeLog.LogInformation($"[3D桌宠] 已注册具身动作工具（bodyact，Implicit｜文档 {embodiedHandler.Document().Length} 字符）");
         }
         catch (Exception e) { AlifeLog.LogError(e); }
     }
@@ -580,10 +489,10 @@ public class DeskPetService(
     }
 
     /// <summary>校验开关并下发「生成式动作」（文字 → 本地模型生成 → 重定向 → 播放；失败由前端退回预置）。</summary>
-    void BodyActPromptCore(string prompt)
+    void BodyActPromptCore(string prompt, double? seconds = null)
     {
         if (!pet.EmbodiedMotionEnabled) throw new Exception("「具身动作」未开启：请先在桌宠设置里打开，再使用 bodyact prompt");
-        pet.GenerateMotion(prompt);
+        pet.GenerateMotion(prompt, seconds);
         interactor.Poke($"已交给本地模型现场生成动作：\"{prompt}\"（首次需加载约 684MB 权重，可能要等十几秒；"
             + "之后就快了：约 1 秒生成 + 2 秒播放）。生成结果不保证精确，若画面没动或不像请改用 preset。");
     }
@@ -598,7 +507,7 @@ public class DeskPetService(
 
             embodiedExprHandler = new XmlHandler(new BodyExpressHost(this))
             {
-                Description = "用「情绪 + 强度 + 保持」驱动角色的真实面部表情与眼嘴（不是文字描述），并可查询真实身体状态。",
+                Description = "用「情绪 + 强度 + 保持」驱动角色的真实面部表情与眼嘴（不是文字描述），并可查询真实身体状态。先输出 <BodyExpressHost/> 读取说明，随后用 <bodyexpress .../> / <bodystate/> 调用。",
                 Explanation = """
                     ## 具身表情（bodyexpress）
                     直接驱动角色的脸，**不需要任何生成模型**（走 VRM 自带表情权重，本地即时合成，不吃显存）。
@@ -635,8 +544,9 @@ public class DeskPetService(
                     <bodystate/> 返回**实际渲染**的表情、表情权重和正在播的动作。不要凭想象描述自己的表情；不确定时先查询。
                     """,
             };
-            functionService.RegisterHandler(embodiedExprHandler, cancellationToken: DestroyCancellationToken);
-            AlifeLog.LogInformation("[3D桌宠] 已注册具身表情工具（bodyexpress / bodystate）");
+            bool injectDoc = pet.BodyExpressDocEnabled;
+            functionService.RegisterHandler(embodiedExprHandler, injectDoc ? DocumentMode.Implicit : DocumentMode.None, DestroyCancellationToken);
+            AlifeLog.LogInformation($"[3D桌宠] 已注册具身表情工具（bodyexpress / bodystate，{(injectDoc ? "Implicit" : "文档注入关闭（靠记忆）")}｜文档 {embodiedExprHandler.Document().Length} 字符）");
         }
         catch (Exception e) { AlifeLog.LogError(e); }
     }
@@ -735,7 +645,8 @@ public class DeskPetService(
             motionIdiomHandler = new XmlHandler(new MotionIdiomHost(this))
             {
                 Description = "写下/更新你自己的「动作人设」：把性格设定与**近期记忆**蒸馏成一小段动作风格契约"
-                    + "（幅度/节奏/小动作密度/平滑/静定 + 惯用动作/忌讳/签名动作）。不填参数=读回当前设定；reset=true=清空。",
+                    + "（幅度/节奏/小动作密度/平滑/静定 + 惯用动作/忌讳/签名动作）。不填参数=读回当前设定；reset=true=清空。"
+                    + "先输出 <MotionIdiomHost/> 读取完整说明，随后用 <motionidiom .../> 调用。",
                 Explanation = """
                     ## 动作人设（motionidiom）—— 让你动起来像"你自己"
 
@@ -795,8 +706,8 @@ public class DeskPetService(
                     `<bodyact preset/spec>` 的幅度与节奏也照上面的数值来（`amp` 大就写更大的角度、`tempo` 小就把 dur 拉长）。
                     """,
             };
-            functionService.RegisterHandler(motionIdiomHandler, cancellationToken: DestroyCancellationToken);
-            AlifeLog.LogInformation("[3D桌宠] 已注册动作人设工具（motionidiom）");
+            functionService.RegisterHandler(motionIdiomHandler, DocumentMode.Implicit, DestroyCancellationToken);
+            AlifeLog.LogInformation($"[3D桌宠] 已注册动作人设工具（motionidiom，Implicit｜文档 {motionIdiomHandler.Document().Length} 字符）");
         }
         catch (Exception e) { AlifeLog.LogError(e); }
     }

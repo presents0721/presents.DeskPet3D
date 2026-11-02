@@ -10,7 +10,7 @@ function postMessage(data) {
 // ---- 本地磁盘文件（模型/动作/贴图常放在插件目录之外）----
 // Alife 5 的前端没有 Node，读不了 fs；宿主给了本机回环静态服务 /disk/<绝对路径>（只读），统一走 fetch。
 const PET_HTTP_BASE = (location.protocol === 'http:' || location.protocol === 'https:') ? location.origin : null;
-/** file:///E:/a/b.vrm → http://127.0.0.1:PORT/disk/E%3A/a/b.vrm（保留 / 分段，供贴图相对路径解析） */
+/** file:///C:/models/a.vrm → http://127.0.0.1:PORT/disk/C%3A/models/a.vrm（保留 / 分段，供贴图相对路径解析） */
 function diskUrl(u) {
   const s = String(u == null ? '' : u);
   if (!/^file:/i.test(s) || !PET_HTTP_BASE) return s;
@@ -133,6 +133,34 @@ let renderer = null, scene = null, camera = null, clock = null, canvas = null;
 let lights = [];
 let booted = false;
 let bootPromise = null;
+
+// ---- Motion Core v2 运行时观察器（Phase 1A：只观察，不接管写骨）----
+// 目的：把“哪一层改了哪些骨、哪些骨被多层同帧改”变成逐帧数据；
+// 默认全开且只读，不影响任何画面。控制台：petMotionReport() / petMotionObserve(false)。
+let motionRuntime = null;
+try {
+  if (window.MotionRuntimeV2) {
+    motionRuntime = new window.MotionRuntimeV2({
+      getVrm: () => vrm,
+      log: (text) => postLog('info', text),
+    });
+  }
+} catch (e) { motionRuntime = null; }
+window.petMotionReport = () => {
+  if (!motionRuntime) return null;
+  const r = motionRuntime.report();
+  try {
+    postLog('info', '[MotionCore] 汇总：帧 ' + r.frames + '｜冲突帧 ' + r.conflictFrames
+      + '（' + (r.conflictRate * 100).toFixed(1) + '%）｜冲突骨 ' + r.conflictBones
+      + '｜层 ' + (Object.keys(r.byLayer).join('、') || '无')
+      + '｜冲突对 ' + (Object.keys(r.byPair).join('、') || '无'));
+  } catch (eR) { }
+  return r;
+};
+window.petMotionObserve = (on) => {
+  if (motionRuntime) motionRuntime.setEnabled(!!on);
+  return !!(motionRuntime && motionRuntime.enabled);
+};
 
 // ---- 模型状态 ----
 let vrm = null;
@@ -276,9 +304,14 @@ function ensureFaceEngine() {
   if (sig === faceEngSig) return faceEng;
   faceEngSig = sig;
   try {
+    // ★ 先告诉引擎"这个模型的 happy 是不是闭眼笑"，它会把 AU 目标里的 happy 换成 relaxed
+    //   （仍是 Soullink 的 AU 合成，不是直接播模型预设）。
+    const ep = embExprEyeProfile();
+    if (faceEng.setEyeCloseHappy) faceEng.setEyeCloseHappy(!!(ep && ep.preferRelaxed));
     const cov = faceEng.setAvailable(avail);
     faceEngCoverage = cov;
-    postLog('info', '[表情引擎] 覆盖 ' + cov.supported + '/' + cov.total + ' 个 AU（模型可用表情 ' + avail.length + ' 个）');
+    postLog('info', '[表情引擎] 覆盖 ' + cov.supported + '/' + cov.total + ' 个 AU（模型可用表情 ' + avail.length + ' 个）'
+      + (cov.supported >= 18 ? ' ⇒ 精细脸（ARKit/AU 级，嘴/眼/眉分开驱动）' : ' ⇒ 粗粒度（整脸代理，细节有限）'));
   } catch (e) { postLog('warn', '表情引擎映射失败：' + (e && e.message)); }
   return faceEng;
 }
@@ -353,6 +386,50 @@ function embExprTargets(emo, intensity, avail) {
   if (ov && avail.indexOf(ov) >= 0) { const o = {}; o[ov] = intensity; return o; }
   const E = window.EmbodiedExpression;
   return E ? E.resolve(emo, intensity, avail) : {};
+}
+
+// ★★ 「闭眼笑」自检：很多模型的 happy/Joy 其实是**闭眼笑**（morph 与 Blink 共用同一批顶点）。
+//   我们拿 VRMExpression.binds 的 morph 顶点做一次交集：happy 与 blink 重合 >80%、
+//   而 relaxed(Fun) <50% ⇒ 这个模型的 happy 会闭眼，改用 relaxed（嘴笑、眼还睁着）。
+//   每个模型算一次（几十毫秒级），结果缓存；用户映射 embodiedFaceMap 仍然优先覆盖。
+let _eyeProfFor = null, _eyeProf = null;
+function embExprEyeProfile() {
+  try {
+    if (vrm && _eyeProfFor === vrm) return _eyeProf;
+    const m = exprMgr();
+    if (!m || !vrm) return null;
+    const get = (n) => (m.getExpression ? m.getExpression(n) : null) || (m.expressionMap && m.expressionMap[n]);
+    const blink = get('blink'), happy = get('happy'), relaxed = get('relaxed');
+    const finish = (p) => { _eyeProfFor = vrm; _eyeProf = p; return p; };
+    if (!blink || !happy || !relaxed) return finish({ preferRelaxed: false, note: '缺少 blink/happy/relaxed' });
+    const moved = (ex) => {
+      const s = new Set();
+      for (const b of (ex.binds || [])) {
+        const ma = b.mesh && b.mesh.geometry && b.mesh.geometry.morphAttributes
+          && b.mesh.geometry.morphAttributes.position;
+        const a = ma && ma[b.index];
+        if (!a) continue;
+        const arr = a.array || [];
+        const cnt = a.count || 0;
+        for (let i = 0; i < cnt; i++) {
+          const x = arr[i * 3] || 0, y = arr[i * 3 + 1] || 0, z = arr[i * 3 + 2] || 0;
+          if (Math.abs(x) + Math.abs(y) + Math.abs(z) > 1e-4) s.add(b.mesh.uuid + ':' + i);
+        }
+      }
+      return s;
+    };
+    const bs = moved(blink);
+    if (!bs.size) return finish({ preferRelaxed: false, note: 'blink 没有 morph 顶点' });
+    const ov = (s) => { if (!s.size) return 0; let n = 0; for (const k of s) if (bs.has(k)) n++; return n / s.size; };
+    const h = ov(moved(happy)), r = ov(moved(relaxed));
+    const p = { preferRelaxed: (h > 0.8 && r < 0.5), happyBlink: h, relaxedBlink: r };
+    try {
+      postLog('info', '表情自检：happy 与眨眼共用顶点 ' + (h * 100).toFixed(0) + '%'
+        + '｜relaxed ' + (r * 100).toFixed(0) + '%'
+        + (p.preferRelaxed ? ' ⇒ happy 改用 relaxed（避免闭眼笑）' : ''));
+    } catch (e) { }
+    return finish(p);
+  } catch (e) { return null; }
 }
 
 // ---- 环境自检：生成式动作(ardy-mini)的前置条件 ----
@@ -502,6 +579,11 @@ function embodiedExpress(spec) {
   // 让位：先把静止/随机表情收回，否则两张脸叠加
   if (baseExprApplied) { embExprWrite(baseExprApplied, 0); baseExprApplied = ''; }
   const faceNames = Object.keys(embExprTargets(emo, embExpr.intensity, embExprAvail()));
+  // 闭眼笑修正也反映到日志里（否则日志说 happy、实际写 relaxed，对不上）
+  try {
+    const ep = embExprEyeProfile();
+    if (ep && ep.preferRelaxed) for (let i = 0; i < faceNames.length; i++) if (faceNames[i] === 'happy') faceNames[i] = 'relaxed';
+  } catch (eEP2) { }
   embExprNote = faceNames.length ? '' : ('该模型没有可用于「' + emo + '」的表情，已改用头部/注视姿态表达');
   postLog('info', '具身表情：' + emo + '（强度 ' + embExpr.intensity +
     (hold > 0 ? '，保持 ' + hold + 's）' : '，一直保持）') + extraNote +
@@ -540,6 +622,14 @@ function applyEmbodiedExpression(dt) {
   const E = window.EmbodiedExpression, avail = embExprAvail();
   const intent = Math.max(0, Math.min(1, +embExpr.intensity || 0));
   const fb = embExprTargets(embExpr.emotion, intent, avail);   // 语义预设（老链路）：粗粒度模型只有这个
+  // 闭眼笑修正：本模型的 happy 与 blink 共用顶点 ⇒ 用 relaxed（嘴笑、眼睁开）承担笑意
+  let eyeProf = null;
+  try { eyeProf = embExprEyeProfile(); } catch (eEPa) { }
+  try {
+    if (eyeProf && eyeProf.preferRelaxed && fb && fb.happy !== undefined && fb.relaxed === undefined) {
+      fb.relaxed = fb.happy; delete fb.happy;
+    }
+  } catch (eEP) { }
   // ★ 目标权重：引擎优先，但按**模型粒度**分流——这是"有的看得见有的看不见"的根因：
   //   粗粒度模型（只有 joy/angry/sorrow/fun 这种整脸预设）上，引擎把 20 个 AU 混出来的主通道
   //   通常只有 0.1~0.4（实测 shy=0.18、thinking=0.11）⇒ 肉眼几乎看不出。
@@ -577,9 +667,14 @@ function applyEmbodiedExpression(dt) {
       for (const n in target) target[n] = Math.min(1, target[n] * k);
     }
   } else if (Object.keys(fb).length) {
-    // 粗粒度 + 有语义预设：**预设打底**（保证看得见），引擎只叠 ≤0.25 的细节（保留"连续变化"）
-    const base = Object.assign({}, fb);
-    for (const n in target) base[n] = Math.min(1, (base[n] || 0) + target[n] * 0.25);
+    // ★ 粗粒度模型：只用**最强的一张脸**。旧版把 `fb` 里所有名字都保留（shy+happy 这类副表情一起加），
+    //   而整脸预设是"各演各的"——相加就是表情乱（日志实测 shy → 害羞+happy）。
+    //   现在只留主表情，引擎细节仍叠 ≤0.15（保留细微变化）。
+    const names = Object.keys(fb);
+    let pn = names[0];
+    for (const n2 of names) if ((fb[n2] || 0) > (fb[pn] || 0)) pn = n2;
+    const base = {}; base[pn] = fb[pn];
+    for (const n in target) base[n] = Math.min(1, (base[n] || 0) + target[n] * 0.15);
     target = base;
   } else if (COARSE_POSE_ONLY.indexOf(embExpr.emotion) >= 0 || maxOf(target) < 0.03) {
     // 模型没有对应预设、引擎也给不出像样的东西（如 thinking：需要眉/眼，这模型没有）
@@ -589,6 +684,17 @@ function applyEmbodiedExpression(dt) {
     // 没有预设但引擎有料（如 shy）：把主通道拉到可见强度，相对比例不变
     const k = Math.min(3, (0.55 + 0.35 * intent) / Math.max(maxOf(target), 1e-6));
     for (const n in target) target[n] = Math.min(1, target[n] * k);
+  }
+  // ★★ 闭眼笑模型：连引擎的 AU 权重里也不要让 happy 占大头。
+  //   真实原理：模型的 happy=Joy 整脸 morph 与眨眼共用顶点；引擎的 AU06（笑眼）会落到它身上。
+  //   这里把 happy 压到 ≤0.18（只留一点眯眼），笑意转给 relaxed(Fun) —— 嘴笑、眼睁开。
+  if (target && eyeProf && eyeProf.preferRelaxed) {
+    const h = +target.happy || 0;
+    if (h > 0.001) {
+      const keep = Math.min(0.18, h * 0.18);
+      target.relaxed = Math.min(1, (+target.relaxed || 0) + (h - keep));
+      target.happy = keep;
+    }
   }
   // 兜底：这个模型没有匹配的表情（或压根没表情）→ 改用姿态表达（任何模型都有效）
   const hasFace = Object.keys(target).length > 0;
@@ -692,7 +798,7 @@ function idleNoise(t, seed) {
 // 头部主体由视线目标偏移驱动（见主渲染循环），这里只补 neck/胸/脊的轻微扭转，
 // 顺带把头发（弹簧骨）带动起来 → 上半身和头发一起小幅晃动。
 function addTrackOffset(o, bn) {
-  const trackOn = !(danceDisableTrack && dancingNow);   // 舞蹈时(开关开)暂停头部/脊椎追踪
+  const trackOn = !(danceDisableTrack && dancingNow) && !actionHeadOwned();   // 舞蹈/具身动作时暂停追踪
   const tf = bodyTurnFade();                            // 整体转身后衰减（否则身体朝后、脖子还拧着看镜头）
   const hk = (headTrack && trackOn) ? Math.max(0, headTrackStrength) * tf : 0;
   const sk = (spineTrack && trackOn) ? Math.max(0, spineTrackStrength) * tf : 0;
@@ -756,7 +862,7 @@ let mmdTrackNeutral = {};
 let mmdTrackState = {};
 let armDropWarned = false;   // “手臂收拢没匹配到骨骼”只提示一次，避免每帧刷屏
 function applyMMDTracking() {
-  const trackOn = !(danceDisableTrack && dancingNow);   // 舞蹈时(开关开)暂停头部/脊椎追踪
+  const trackOn = !(danceDisableTrack && dancingNow) && !actionHeadOwned();   // 舞蹈/具身动作时暂停追踪
   const tf = bodyTurnFade();                            // 整体转身后同样要衰减（PMX 也走这条）
   const hk = (headTrack && trackOn) ? Math.max(0, headTrackStrength) * tf : 0;
   const sk = (spineTrack && trackOn) ? Math.max(0, spineTrackStrength) * tf : 0;
@@ -977,6 +1083,7 @@ async function scheduleIdleMotion(dt) {
   if (currentPose !== 'stand') return;                 // 坐/躺不做（会穿模），让姿势本身表现
   if (dancingNow || currentMotionAction) return;        // 正在跳/选中动作：让位
   if (gestureAction || dragAction) return;              // 正在播（含上一支待机动作）：等它播完
+  if (motionActionOwner) return;                        // ★ P1B：有动作所有者（clip/bodyact/生成/静态保持）时不做待机小动作
   idleMotionTimer -= dt;
   if (idleMotionTimer > 0) return;
   const pool = idleMotionPool();
@@ -1055,11 +1162,16 @@ const POSES = {
     bones: { chest: { x: 0.05 }, leftUpperArm: { z: 0.15 }, rightUpperArm: { z: -0.15 } }
   },
 };
+// 全身坐 = 与 sit 同一套骨骼，但**不裁腿**：普通窗口里能看到完整坐姿；
+// 任务栏落座仍用 sit（上半身取景，腿留在任务栏下方）。
+POSES.sit_full = POSES.sit;
+
 let poseRootTarget = { rx: 0, ry: 0, rz: 0, y: 0 };
 let poseRootCur = { rx: 0, ry: 0, rz: 0, y: 0 };
 
 // ---- 接地（脚踩地面）：让当前动作的最低接触点钉在“站立地面线”上，消除跳舞脚悬空/软绵绵的鱼扑腾感 ----
 let restFootRelY = 0;            // 站立姿态下最低脚相对 petRoot 原点的 Y（即“地面线”）
+let groundInitScale = 1;         // 量 restFootRelY 时的「大小」：之后按 scale 比例换算，滚轮改大小线也跟着走
 let clipGroundCache = new Map(); // clip -> (clip最低脚相对Y - restFootRelY)；播放时 petRoot.y 减去它
 let groundInited = false, groundInitT = 0;
 let showGroundLine = true;    // 是否显示“地面参考线”（屏幕空间极细两条线，不是阴影块）
@@ -1112,22 +1224,32 @@ function measureClipGround(clip) {
   //   本帧结束。若本帧后面没人再传导（或顺序有变），画面上就是"抽到另一支动作的姿势一瞬间、然后回来"
   //   （用户实测："摆完姿势有时候会抽搐到另一个动作一瞬间"）。补这一步让它当帧就一致，不靠运气。
   try { vrm.update(0); } catch (e) { }
-  return minRel - restFootRelY;
+  // ★ restFootRelY 是"量测时的大小"下的值；这里先折算到**当前大小**再相减，
+  //   否则改过「大小」之后 restFootRelY 与 minRel 不在同一尺度，偏移会差 s/s0 倍。
+  const sNowG = Math.max(0.01, lastOpts.scale || 1);
+  const restNow = restFootRelY * (groundInitScale > 0 ? (sNowG / groundInitScale) : 1);
+  return minRel - restNow;
 }
 function getClipGroundOffset(clip) {
   if (!clip) return 0;
-  if (clipGroundCache.has(clip)) return clipGroundCache.get(clip);
+  // ★★ 缓存值按 **scale=1** 归一化存，返回时再乘当前「大小」。
+  //   为什么：measureClipGround 量出来的是**世界单位**（随 vrm.scene.scale 线性变），
+  //   而旧代码原样缓存、永远按量测那次的大小使用 ⇒ 用户改「大小」后所有动作的接地偏移全是旧尺度的，
+  //   脚就会沉到窗口底下/悬空（用户："放大缩小人物会脚超出渲染范围，地面准线意义何在"）。
+  const sNow = Math.max(0.01, lastOpts.scale || 1);
+  if (clipGroundCache.has(clip)) return clipGroundCache.get(clip) * sNow;
   // 诊断：**每支动作只量一次**（结果有缓存）⇒ 每行只打一次，不会刷屏。
   // 用途：如果"抽搐到另一个动作一瞬间"正好紧跟这行，那就是量测在那一帧留下的痕迹（用来对齐时间点）。
   // 措辞避开探针关键词（`量测` 在 PROBE_HINTS 里 ⇒ 会被静默），否则这行等于没加。
   try { postLog('info', '地面偏移（一次性，每支动作一次）：' + (clip.name || '?') + '（时长 ' + (+(clip.duration) || 0).toFixed(2) + 's）'); } catch (e) { }
   let off = 0; try { off = measureClipGround(clip); } catch (e) { off = 0; }
-  clipGroundCache.set(clip, off);
+  clipGroundCache.set(clip, off / sNow);   // 归一化到 scale=1 存
   return off;
 }
 // 待机姿态稳定后做一次（采样所有动作的最低脚 + 站立地面线），结果缓存
 function initGrounding() {
   const saved = saveHumanoidState();
+  groundInitScale = Math.max(0.01, lastOpts.scale || 1);   // 记下量测时的大小，供地面线按比例跟随
   restFootRelY = measureLowestFootRelY();
   try { const box = new THREE.Box3().setFromObject(vrm.scene); modelHalfWidth = Math.max(0.2, (box.max.x - box.min.x) * 0.5); } catch (e) { }
   groundLineL = document.getElementById('ground-line-l');   // 屏幕空间地面线左右两段（每帧投影定位）
@@ -1374,7 +1496,7 @@ function setPose(name) {
   // 整体变换：坐姿把胯降到原来脚底的高度（臀部坐到窗口底边，腿垂在底边下方）
   const r = preset.root;
   poseRootTarget = { rx: r.rx, ry: r.ry, rz: r.rz, y: r.y };
-  if (name === 'sit') poseRootTarget.y = -(modelHipY - modelFloorY);
+  if (name === 'sit' || name === 'sit_full') poseRootTarget.y = -(modelHipY - modelFloorY);
   // （currentPose 已在函数开头赋值 —— refreshPoseTargets 依赖它）
   invalidateNaturalSize();   // 姿势变了 → 自然尺寸缓存失效，重新测量
   reframe();
@@ -1457,6 +1579,7 @@ async function boot() {
       // 自动跳舞调度本身的异常也要兜住：否则一炸就是整帧渲染中断 → 画面卡死、跳舞不再推进
       updateDance(dt).catch(e => console.warn('[3D桌宠] 自动跳舞调度异常', e));
       if (vrm) {
+        try { if (motionRuntime) motionRuntime.beginFrame(dt); } catch (eM0) { }
         scheduleIdleMotion(dt).catch(e => console.warn('[3D桌宠] 待机动画调度异常', e));
         // 面板开着时每 ~1 秒重算一次取景：只用于"面板被拖动 / 内容变宽"这类缓慢变化。
         // 不去高频重算的原因：面板矩形自己会抖，算得越勤抖得越明显（实测"左右疯闪"）。
@@ -1542,7 +1665,7 @@ async function boot() {
           // 坐姿的下沉量（把胯降到落地线）必须无条件生效：
           // 站立时"有动作在播就清零整体位移"是为了让脚被动作的接地偏移钉住地面，
           // 但坐姿的位移是"坐下去"本身，被清零就会整个人弹起/掉下去 → 表现为"被种地里"。
-          const rootY = (currentPose === 'sit') ? poseRootCur.y : ((ga ? 0 : poseRootCur.y) - groundOff);
+          const rootY = (currentPose === 'sit' || currentPose === 'sit_full') ? poseRootCur.y : ((ga ? 0 : poseRootCur.y) - groundOff);
           // 整体转身（具身动作的 turn）：叠加在姿势预设的 ry 之上 ⇒ "背过身去"这类大幅转身才成立。
           // 放在这里是有意的：petRoot 是所有接触点/取景的共同基准，转它 = 整个人（含脚）一起转。
           const turnYaw = applyEmbodiedTurn(dt);
@@ -1569,6 +1692,7 @@ async function boot() {
             bone.rotation.set(rx, ry, rz);
           }
         }
+        try { if (motionRuntime) motionRuntime.mark('base', 0); } catch (eM1) { }
         // 具身重定向中性基准：等基础姿态收敛（~0.4s）后采集一次。
         // 位置很关键：此刻基础姿态层已写入、而 mixer 还没跑 → 采到的才是“自然姿势”，不是 T-pose。
         if (embodiedNeedNeutral && vrm && vrm.humanoid) {
@@ -1599,11 +1723,12 @@ async function boot() {
           // three-vrm 的 lookAt 只转头骨+眼睛（不靠整根骨骼硬扭），目标偏移太小时头只能转几度、还只有眼睛在动，
           // 于是看起来“不灵敏、方向对不上鼠标”；放大后整颗头能明显、准确地转向光标，手感对齐 PMX。
           const amp = Math.max(1.2, (camera.position.z || 6) * 0.7);
-          const hk = (headTrack && !(danceDisableTrack && dancingNow)) ? Math.max(0, headTrackStrength) * bodyTurnFade() : 0;   // 舞蹈时(开关开)暂停头部跟随；整身转身后衰减
+          const _actionHead = actionHeadOwned();
+          const hk = (headTrack && !(danceDisableTrack && dancingNow) && !_actionHead) ? Math.max(0, headTrackStrength) * bodyTurnFade() : 0;   // 舞蹈/具身动作时暂停头部跟随；整身转身后衰减
           const swx = 0, swy = 0;   // 待机改由 VRMA 动作驱动，去掉头部基础慢摆（原来的“晃”）
           // 情绪视线（度→世界偏移）：tan(角) 才是"看上去转了几度"的正确换算；
           // 只在头部跟随允许时叠加（用户关了头部追踪就别让表情偷转头）。
-          const gazeK = (headTrack && !(danceDisableTrack && dancingNow)) ? 0.7 : 0;
+          const gazeK = (headTrack && !(danceDisableTrack && dancingNow) && !_actionHead) ? 0.7 : 0;
           const gx = Math.tan(embGazeDeg.x * Math.PI / 180) * amp * gazeK;
           const gy = Math.tan(embGazeDeg.y * Math.PI / 180) * amp * gazeK;
           lookTargetObj.position.set(
@@ -1613,7 +1738,10 @@ async function boot() {
         }
         // three-vrm 官方推荐顺序：先让 mixer 把动画写到归一化骨骼，再 vrm.update 把归一化骨骼传导到原始骨骼（驱动蒙皮）。
         // 反过来的话原始骨骼会晚一帧才拿到动画值。
-        if (vrmMixer) vrmMixer.update(dt);
+        // ★ P1B：动作所有权硬闸门 —— 具身/生成/静态保持拥有骨骼时，mixer 不再写（含退化中的旧动作）。
+        //   否则“点播动作 + 静态保持 + 生成层”会在腿/脚上同帧互盖（日志已实证 3 层抢 leftLowerLeg）。
+        if (vrmMixer && (!motionActionOwner || motionActionOwner === 'clip')) vrmMixer.update(dt);
+        try { if (motionRuntime) motionRuntime.mark('clip', 3); } catch (eM2) { }
         // 每帧开头清掉"其他层留下的状态"：骨盆增量/写标记必须只反映**本帧**的真实写入者，
         // 否则上一帧的值会让钉位/让位判定用到过期信息（曾导致 ardy 播放时腿被"钉"住）。
         // ★★ v11.33 版本戳：渲染循环第一次执行时打一行。以后"改了没生效？" 看这行就行 ——
@@ -1623,7 +1751,7 @@ async function boot() {
         if (!_verStamped) { _verStamped = true; postLog('info', '★ 前端代码版本 v11.33（含：接触自检心跳 / 具身异常探针 / 层冲突审计 / 放下实况）'); }
         if (typeof performance !== 'undefined' && performance.now() - _rtBeat > 5000) {
           _rtBeat = performance.now();
-          postLog('info', '· 渲染心跳 v11.50（每 5s 一条；本行出现 ⇒ 新代码在跑｜具身接管=' + (!!embodiedYielding) + ' 队列=' + (embodiedQueue ? embodiedQueue.length : -1) + '｜生成层=' + (!!ardyActive) + '）');
+          postLog('info', '· 渲染心跳 v11.66（每 5s 一条；本行出现 ⇒ 新代码在跑｜具身接管=' + (!!embodiedYielding) + ' 队列=' + (embodiedQueue ? embodiedQueue.length : -1) + '｜生成层=' + (!!ardyActive) + '）');
         }
         // ★★ v11.36「动作实测」（放在所有具身层**之前** ⇒ 任何一层抛异常都杀不死它）。
         //   门控三连（缺一个就全是废数据，这三坑我都踩过）：
@@ -1638,19 +1766,23 @@ async function boot() {
         //      —— 全是假数据，白调了三轮参数。
         embodiedPelvicQ = null; embodiedWroteFrame = false; _embFingerDriven = false;
         applyEmbodiedRetarget(dt);          // 具身动作层（默认关：no-op）
+        try { if (motionRuntime) motionRuntime.mark(embodiedQueueIsHold ? 'hold' : 'embodied', 4); } catch (eM3) { }
         // ★★ v11.34b：这两层以前**没有** try —— 一旦抛异常，后面的 contactProbe / layerClashAudit /
         //   applyEmbodiedLegPin / syncSpringColliders **全部不执行**（症状：观测日志全无、腿钉位失效、
         //   弹簧碰撞球不更新）。现在各自隔离并上报，异常不再"静默吃掉半条渲染管线"。
         try { applyEmbodiedRoot(); } catch (e) {
           if (performance.now() - _embErrT > 3000) { _embErrT = performance.now(); postLog('info', '★ applyEmbodiedRoot 异常：' + (e && e.message ? e.message : e)); }
         }                // 根位移（下蹲）：每帧校正，让位时自动归零
+        try { if (motionRuntime) motionRuntime.mark('root', 4); } catch (eMr) { }
         try { applyArdyRetarget(dt); } catch (e) {
           if (performance.now() - _embErrT > 3000) { _embErrT = performance.now(); postLog('info', '★ applyArdyRetarget 异常：' + (e && e.message ? e.message : e)); }
         }              // ardy 生成动作层（无队列时 no-op）
+        try { if (motionRuntime) motionRuntime.mark('ardy', 5); } catch (eM4) { }
         contactProbe(dt);                   // ★ v11.24 接触自检（肘弯过 100° 时报"手距头多远/哪一侧偏"）
         layerClashAudit();                  // ★ v11.29 骨骼层冲突审计（动作播放中被别的层抢骨骼时点名）
         // ★ 放在最后一层之后：动胯时钉住髋窝。谁在我们之后又重置了骨骼位置，也得被它盖过。
         applyEmbodiedLegPin();              // 归一化层：保持内部一致（compose 语义 / 别的消费者读它）
+        try { if (motionRuntime) motionRuntime.mark('legpin', 4); } catch (eM5) { }
         // ★★ v11.39「动作实测」—— 放在**所有具身层之后**（retarget/root/ardy/legPin 都写过骨了）
         //   ⇒ 读到的才是本帧真正摆出来的姿势（放前面读到的是静止姿势，数据全是假的）。
         //   门控：`embodiedYielding`（本层拿骨骼）+ `!currentMotionAction`（舞蹈时不报）
@@ -1692,18 +1824,42 @@ async function boot() {
         // ★★ 必须放在 vrm.update 之后：把**原始骨骼**（蒙皮真正用的那套）的腿根也钉住。
         //    three-vrm 只把归一化骨骼的位置写给 hips，其余骨骼的位置不传导 —— 只在归一化层钉，画面上等于没钉。
         applyEmbodiedLegPinRaw();
+        try {
+          if (motionRuntime) {
+            motionRuntime.mark('physics', 1);
+            let _mState = 'IDLE';
+            if (ardyActive) _mState = 'GENERATIVE';
+            else if (currentMotionAction || dancingNow) _mState = 'ACTION';
+            else if (embodiedQueueIsHold) _mState = 'POSE_EDIT';
+            else if (embodiedYielding) _mState = 'ACTION';
+            else if (gestureAction || dragAction) _mState = 'GESTURE';
+            motionRuntime.endFrame(_mState);
+          }
+        } catch (eM6) { }
         tickPoseJumpWatch(dt);              // 姿势"瞬跳"看门狗（自动抓抽搐现场，见函数注释）
         if (_embFingerDriven) thumbsCheck();   // 拇指方向核对（有手指骨被驱动时才量）
         ardyTraceSample('写入后');           // 采样点 2：本层写入之后 —— 交还的跳变只能在这里看到（采样点 1 在层入口）
         ardyAimCheck();                      // aim 落地校验：目标方向是否真的落到了骨骼上
-        // 地面参考线（屏幕空间、固定不随角色动）：只投影“站立地面线”这个固定世界点。
-        // 画成左右两段、中间留空——不盖在人物模型上（角色正下方不画线），两侧保留参考。
+        fitGuardTick();                      // 取景越界自检：头顶/脚踝出画就自动重取景（节流 400ms）
+        // 地面参考线（屏幕空间）：每条线都按**当前**地面高度 / 模型中心 / 模型宽度投影。
+        //   旧实现把 initGrounding 时量到的 `restFootRelY` 与 `modelHalfWidth` 写死在投影里 ⇒
+        //   一改「大小」线就留在旧高度/旧宽度，跟脚完全对不上（用户："地面准线意义何在"）。
         if (groundLineL && groundLineR) {
           if (showGroundLine && groundInited) {
-            const c = _gv3().set(0, restFootRelY, 0).project(camera);
+            const sNow = Math.max(0.01, lastOpts.scale || 1);
+            // 地面高度 = 站立脚相对 petRoot 的高度 × 当前大小（不含 petRoot.y：
+            // 坐姿下沉/动作接地偏移移动的是**人**，地面本身不动）。
+            const gy = restFootRelY * (groundInitScale > 0 ? (sNow / groundInitScale) : 1);
+            let gx = 0, gz = 0, halfW = modelHalfWidth;
+            if (lastFitBox && !lastFitBox.isEmpty()) {
+              const gc = lastFitBox.getCenter(new THREE.Vector3());
+              gx = gc.x; gz = gc.z;
+              halfW = Math.max(0.05, (lastFitBox.max.x - lastFitBox.min.x) * 0.5);
+            }
+            const c = new THREE.Vector3(gx, gy, gz).project(camera);
             const W = renderer.domElement.clientWidth, H = renderer.domElement.clientHeight;
             const cx = (c.x * 0.5 + 0.5) * W, cy = (-c.y * 0.5 + 0.5) * H;
-            const e = new THREE.Vector3(modelHalfWidth, restFootRelY, 0).project(camera);
+            const e = new THREE.Vector3(gx + halfW, gy, gz).project(camera);
             const ex = (e.x * 0.5 + 0.5) * W;
             const hwpx = Math.max(8, Math.abs(ex - cx));     // 模型半宽（屏幕像素，给下限防退化）
             const gapHalf = hwpx * 1.15;                     // 人物占用半宽 + 余量（中间留空，不盖模型）
@@ -1917,11 +2073,11 @@ function clearModel() {
   try { _springOrigUpdate = null; _springStepWrap = null; } catch (e) { }   // 弹簧骨包装重来（新 manager）
   _springPhysApplied = false;   // 换模型 ⇒ 允许下一次 applyVrmPhysics 真正重新应用一遍
   _chainMemFor = null; _chainMem = null;   // 弹簧骨链缓存同样失效（新模型的链不一样）
+  try { footPole.leftReady = false; footPole.rightReady = false; } catch (e) { }   // 膝盖极向状态重来
   // ★ 2026-10-14 第四轮：换模型时**必须**把「鼠标摸」的球摘掉 —— 它挂在**旧模型**各关节的
   //   `colliderGroups` 里，而 `ensureTouchCollider` 见 touchGroup 非空就直接 return true ⇒ 新模型的
   //   弹簧骨永远收不到球（表现："换了模型后摸不动了，日志也不报错"）。顺手把碰撞体体检状态复位。
   try { touchDropCollider(''); } catch (e) { }
-  try { _springColliderChecked = false; _springColliderFast = true; } catch (e) { }
   try { _poseAxesLogged = false; } catch (e) { }   // 换模型 ⇒ 姿势轴向自检重新量、重新打
   try { _chanDirsDone = false; } catch (e) { }     // 换模型 ⇒ 通道方向核对也重来
   if (vrm) { if (petRoot) petRoot.remove(vrm.scene); else scene.remove(vrm.scene); vrm = null; }
@@ -2011,6 +2167,19 @@ let panelFitAcc = 0;           // 面板打开期间的取景重算节流累加�
 let fitDbgBox = null, fitDbgFree = null, fitDbgLast = '', fitDbgT = 0, _fitDbgV = null;  // 让位自检
 let fitBuildLogged = false;    // 构建标记只打一次："跑的是不是新构建"这个坑已踩过两轮
 let fitBaseSig = '', fitBaseT = 0;   // 基础取景自检（面板没开时也要能看出"人物为什么变小"）
+let fitScaleClampSig = '';           // 「大小自适应限幅」日志去重
+let fitGuardT = 0;                   // 取景越界自检节流（见 renderTick 里的 fitGuardTick）
+// 自适应安全框：模型宽/高最多占窗口的比例（0.90 = 留 10%；>1 = 允许超出窗口/切边）。
+// 控制台 `petFitSafeFill(0.9|1.2)` 可即时调；改完自动重取景。默认 0.90（用户要的"脚别出画"）。
+let fitSafeFill = 0.90;
+window.petFitSafeFill = function (v) {
+  if (v === undefined) return fitSafeFill;
+  fitSafeFill = Math.max(0.5, Math.min(1.5, +v || 0.9));
+  fitScaleClampSig = '';
+  try { reframe(); } catch (e) { }
+  try { postLog('info', '取景安全框 = ' + Math.round(fitSafeFill * 100) + '%（>100% 允许切边，<100% 留白更多）'); } catch (e) { }
+  return fitSafeFill;
+};
 let panelSpaceReq = -1;              // 已向宿主请求的"画布加宽"像素（0 = 未加宽）；只按状态变化发一次
 // ---------------------------------------------------------------------------
 // 实时"姿势包络"（取代加载时的静态包络 envReachH/W 作为取景依据）
@@ -2125,9 +2294,32 @@ function fitCamera() {
     fitPoseNeedH = 0; fitPanelLiveH = 0;
     needH = Math.max(poseNeedNow, liveTerm);
   }
+  // ★★ 自适应限幅（用户："放大缩小人物会脚超出渲染范围，地面准线意义何在，自适应能力跑哪去了"）：
+  //   上面所有取景量都按 scale=1 的自然尺寸算（nat），而「大小」可以拉到 2.2 ⇒ 模型真的被放大 2.2 倍，
+  //   取景框却没变 ⇒ 脚/头顶/两侧直接出画。这里用**当前（含 scale + 姿势）实际包围盒**兜底：
+  //   保证模型宽/高最多占窗口 90%（留 10%），超出就自动把相机后退。
+  //   ⇒ 大小滑条仍然有效，但到接近满框为止（再大不会把人裁掉）。
+  const curH = Math.max(0.05, box.max.y - box.min.y);
+  const curW = Math.max(0.05, box.max.x - box.min.x);
+  const FIT_SAFE_FILL = Math.max(0.5, Math.min(1.5, fitSafeFill));
+  const baseNeedH = needH;
+  needH = Math.max(needH,
+    (curH / FIT_SAFE_FILL) * zoom * BASE_FILL,
+    (curW / (FIT_SAFE_FILL * aspect)) * zoom * BASE_FILL);
   let r = (needH * 0.5 / tanHalf) / (zoom * BASE_FILL);
   let V = 2 * r * tanHalf;                // 模型平面上的可视高度
   viewH = V;                              // 供头部/眼部追踪换算偏移量（跟随角度与姿势/缩放无关）
+  if (needH > baseNeedH + 1e-4) {
+    const sigC = (lastOpts.scale || 1).toFixed(2) + '/' + curH.toFixed(2) + '/' + curW.toFixed(2) + '/' + V.toFixed(2);
+    if (sigC !== fitScaleClampSig) {
+      fitScaleClampSig = sigC;
+      try {
+        postLog('info', '取景自适应：大小 ' + (+(lastOpts.scale || 1)).toFixed(2)
+          + ' ⇒ 模型占窗口 ' + Math.round(curH / V * 100) + '% 高 / ' + Math.round(curW / (V * aspect) * 100) + '% 宽'
+          + '（已限到 ≤' + Math.round(FIT_SAFE_FILL * 100) + '%，脚与头顶不再出画）');
+      } catch (eCL) { }
+    }
+  } else fitScaleClampSig = '';
 
   // 设置面板打开时：把宠物平移到面板另一侧空闲区域，避免面板挡住角色、看不到调整效果。
   // 做法为整体平移相机（连看向目标一起平移），宠物在屏幕上反向移动；渲染与鼠标穿透坐标都随之变化，无需改交互逻辑。
@@ -2542,6 +2734,15 @@ function applySpringScale(s) {
 //   ⇒ 求解器算出的 nextTail == 当前 tail ⇒ 姿势不再变化（= 钉住）；再 `reset()` 一次回到静止姿势。
 //   **解冻**用 `_springJointBase` 里的作者原值写回（与「物理·碰撞体积」共享同一份基线 ⇒ 无损）。
 let _chainMemFor = null, _chainMem = null;
+// ★ "短链"（关节 ≤3 的饰品/发丝物理链，如 `Upper_leg.L.001`、`Cloak 01.L`）：
+//   父骨一帧内大幅改写（跳跃/落地/收尾交还）会把这类链甩到 100°~175° 翻面。
+//   它们都是**局部饰品**，所以只对短链做**单帧角速度限幅**（见 `_springShortGuardBegin/End`）；
+//   ★ 裙子**例外**：裙子是主体布料，必须保留完整碰撞响应（限幅会让"身体下压时裙摆被腿顶开"
+//     慢半拍/顶不出去）。长链（长发/长裙）同样不动 —— 那些需要自然的惯性拖尾。
+const SPRING_SHORT_CHAIN_MAX_JOINTS = 3;
+// ★ 分隔符要宽容：VRM 导入后骨名常被规范成 `Strip_02` / `Strip02` / `Strip 02`（点/空格都可能变下划线），
+//   旧写法只认 `Strip 02` ⇒ 橘雪莉的裙摆链没被识别（日志实证：挂到裙摆 0 条链），裙子仍在吃限幅。
+const SPRING_SKIRT_CHAIN = /(skirt|スカート|裙|dress|ドレス|hem|裾|ペチコート|strip[._\s-]*\d+)/i;
 function springChains() {
   if (!vrm || !vrm.springBoneManager) return [];
   if (_chainMemFor === vrm && _chainMem) return _chainMem;
@@ -2575,6 +2776,7 @@ function springChains() {
     out = Array.from(byRoot.values());
     // 长链在前（裙×48 那种先出现），短的（怀表/胸）在后 —— 和用户描述的顺序一致
     out.sort((a, b) => (b.joints.length - a.joints.length) || String(a.name).localeCompare(String(b.name)));
+    for (const e of out) e.shortChain = (e.joints.length <= SPRING_SHORT_CHAIN_MAX_JOINTS) && !SPRING_SKIRT_CHAIN.test(String(e.name || ''));
   } catch (e) { out = []; }
   _chainMemFor = vrm; _chainMem = out;
   return out;
@@ -2709,12 +2911,74 @@ function _springStepWrapped() {
   if (_springStepWrap) return _springStepWrap;
   _springStepWrap = function (dt) {
     if (!_springOrigUpdate) return;
+    // ★★ 必须在 humanoid.update 之后、各弹簧关节求解之前刷新碰撞体（否则碰撞球永远慢一帧）
+    syncSpringColliderMatricesNow();
+    const short = _springShortGuardBegin();
     const n = springSubSteps();
-    if (n <= 1 || !(dt > 0)) return _springOrigUpdate(dt);
+    if (n <= 1 || !(dt > 0)) {
+      _springOrigUpdate(dt);
+      _springShortGuardEnd(short);
+      return;
+    }
     const sub = dt / n;
     for (let i = 0; i < n; i++) _springOrigUpdate(sub);
+    _springShortGuardEnd(short);
   };
   return _springStepWrap;
+}
+
+// ---- ★ 弹簧骨"短链"单帧角速度限幅（治 `Upper_legL001` / `Cloak_12L` 在跳跃、收尾交还时单帧翻 100°~175°）----
+// 只限"短链"（关节 ≤ SPRING_SHORT_CHAIN_MAX_JOINTS，见 springChains 的 shortChain 标记）；
+// 长发/裙摆这类长链完全不受影响。
+// 为什么要限**局部**四元数：vrm.update 的顺序是 humanoid.update → springBoneManager.update，
+//   量一帧头尾的局部差 = 只含弹簧骨自己的贡献；父骨带动链刚性跟随的部分落在父骨上、不进这个差值。
+//   正常摆动每帧通常 <10°，只有"甩翻"才会一次 >30° ⇒ 触发后在 1~几帧里转过去，而不是闪一下再回来。
+// 实现放在子步包装的**整帧末尾**：中间子步的朝向不渲染，限它们没有意义。
+let _shortGuardInfoFor = null, _shortGuardPrevQ = null, _shortGuardTmpQ = null;
+const SPRING_SHORT_MAX_DEG = 30;
+function _springShortGuardBegin() {
+  if (!vrm || !THREE) return null;
+  let bones = null;
+  try {
+    for (const ch of springChains()) {
+      if (!ch.shortChain) continue;
+      for (const j of ch.joints) {
+        const b = j && j.bone;
+        if (!b || !b.quaternion) continue;
+        (bones || (bones = [])).push({
+          b: b, x: b.quaternion.x, y: b.quaternion.y, z: b.quaternion.z, w: b.quaternion.w,
+        });
+      }
+    }
+  } catch (e) { return null; }
+  if (_shortGuardInfoFor !== vrm) {
+    _shortGuardInfoFor = vrm;
+    try {
+      postLog('info', bones
+        ? ('弹簧骨短链限幅：' + bones.length + ' 根（关节 ≤' + SPRING_SHORT_CHAIN_MAX_JOINTS + '，单帧 ≤' + SPRING_SHORT_MAX_DEG + '°，防跳跃/收尾翻面）')
+        : ('弹簧骨短链限幅：本模型没有 ≤' + SPRING_SHORT_CHAIN_MAX_JOINTS + ' 关节的短链（长链保持原物理）'));
+    } catch (e) { }
+  }
+  return bones;
+}
+function _springShortGuardEnd(prev) {
+  if (!prev || !prev.length || !THREE) return;
+  if (!_shortGuardPrevQ) { _shortGuardPrevQ = new THREE.Quaternion(); _shortGuardTmpQ = new THREE.Quaternion(); }
+  const lim = SPRING_SHORT_MAX_DEG * Math.PI / 180;
+  for (const e of prev) {
+    const q = e.b.quaternion;
+    _shortGuardPrevQ.set(e.x, e.y, e.z, e.w);
+    let dot = Math.abs(_shortGuardPrevQ.dot(q));
+    if (dot > 1) dot = 1;
+    const ang = 2 * Math.acos(dot);
+    if (ang <= lim) continue;
+    _shortGuardTmpQ.copy(q);
+    q.slerpQuaternions(_shortGuardPrevQ, _shortGuardTmpQ, lim / ang);
+    q.normalize();
+    // ★ 关键：three-vrm 把弹簧骨的 matrixAutoUpdate 设成 false（矩阵由它自己 updateMatrix 写）。
+    //   只改 quaternion 不重建 local matrix，渲染仍用旧的 matrix ⇒ 限幅等于没生效。
+    try { if (typeof e.b.updateMatrix === 'function') e.b.updateMatrix(); } catch (e2) { }
+  }
 }
 function applySpringSubSteps(n, quiet) {
   if (n !== undefined) {
@@ -2869,21 +3133,11 @@ function applyVrmStyle(on, quiet) {
 }
 window.petVrmStyle = function (on) { return applyVrmStyle(on); };
 
-// ---- 弹簧骨碰撞体：每帧同步 + 一次性自检 ----
-// 为什么必须自己做：three-vrm v3 里 `VRMSpringBoneCollider extends Object3D`，而**碰撞计算真正读的是
-//   `colliderMatrix`**（不是 matrixWorld）——它只在碰撞体自己的 `updateWorldMatrix()` 里重算
-//   （见 VRMSpringBoneCollider.updateWorldMatrix → updateColliderMatrix）。
-//   而 `VRMSpringBoneManager.update()` 只对 `_ancestors` / 各弹簧骨 / 骨骼后代里"没挂弹簧骨的中间节点"
-//   调 updateWorldMatrix，**并不逐个遍历 collider** ⇒ 碰撞球可能一直停在**加载那一刻**的姿势上。
-//   症状正好是用户报的那样：站着不动看不出来（碰撞球刚好贴着腿），**一做动作腿动了、碰撞球没跟上
-//   ⇒ 裙子/衣服直接穿过腿**（"物理好像不是开着的、做动作衣服会穿模"）。别的播放器看着正常，
-//   是因为它们要么自己每帧同步、要么用的是带场景图同步的老版本 API。
-// 做法：`updateWorldMatrix(true, false)` 是幂等的（重算自身与父级世界矩阵，再顺带重算 colliderMatrix），
-//   重复调用**无害** ⇒ 就算将来 three-vrm 自己也会同步，这里多调一遍也不会有副作用。
-let _springColliderChecked = false;
-// ★ 2026-10-14 第四轮：碰撞体同步降开销 —— 实测"过期 0"⇒ 走"每 2 秒抽样体检"的快路径（详见 syncSpringColliders）
-let _springColliderFast = true, _springColliderCheckT = -1e9;
-let _springColliderStaleHits = 0;   // ★ v11.36c 连续判过期的次数（只有连续 2 次才切回每帧全量，防止单帧误判）
+// ---- 弹簧骨碰撞体：求解前每帧同步（见 syncSpringColliderMatricesNow）----
+// three-vrm v3 的碰撞计算真正读的是 `colliderMatrix`（不是 matrixWorld），它只在碰撞体自己的
+// `updateWorldMatrix()` 里重算；而 `VRMSpringBoneManager.update()` 只刷弹簧骨祖先骨，**不逐个刷 collider**。
+// ★ 刷新必须放在 `humanoid.update()` 之后（那时 raw 骨才是当前姿势），否则刷到的还是上一帧 ⇒
+//   碰撞球慢一帧，高抬腿时裙子不被顶起、腿直接穿过。调用点在 `_springStepWrapped` 入口。
 // ================= ★★ 鼠标"触摸"：把光标变成弹簧骨碰撞球（移植 Mate-Engine 的做法）=================
 // 依据（它的真实源码 AvatarBigScreenTouchHandler.cs）：在鼠标位置生成一个**隐藏球碰撞体**，注册进
 //   VRM 弹簧骨碰撞组、并逐个加到每根弹簧骨上 ⇒ **头发/裙摆真的被鼠标推开、揉动**；再把 Animator 的
@@ -2981,6 +3235,72 @@ function _makeTouchSphere() {
   collider.updateColliderMatrix = function () { this.colliderMatrix.copy(this.matrixWorld); };
   const group = { name: 'MouseTouchColliderGroup', colliders: [collider] };
   return { group: group, collider: collider, shape: shape };
+}
+// ---- ★★ 膝部安全碰撞球：治"下压身体/蹲跪时裙摆嵌进膝盖" ----
+// 模型自带的裙摆碰撞主要是**大腿**上的一圈大球（橘雪莉 VSK_* 半径 0.25m）；
+// 小腿只有 0.06m 的小球，而且**膝盖位置没有球** ⇒ 蹲下时膝盖顶进裙摆、裙子直接嵌在腿里；
+// 高抬腿时大腿大球先把裙子顶开，所以会出现"主动抬腿可以、被动下压不行"的不对称。
+// 这里给左右小腿骨各补一个膝盖球，并且**只挂到裙摆链**（数字 Strip / Skirt / 裙…）——
+// 头发、披风、发饰一律不挂，避免被膝盖顶开。
+// 跟随方式与鼠标球一致：球是小腿骨的子节点，`updateWorldMatrix` override 会把世界矩阵写进 colliderMatrix；
+// 每帧由 `syncSpringColliderMatricesNow()` 在求解前刷新（与模型自带碰撞体同一时序）。
+let _kneeColliderFor = null;
+function ensureKneeColliders() {
+  if (!vrm || !vrm.humanoid || !vrm.springBoneManager || !THREE) return 0;
+  if (_kneeColliderFor === vrm) return 0;
+  _kneeColliderFor = vrm;
+  const RAD = 0.09;                      // 模型单位（随后由 applySpringScale 按"大小"等比缩放）
+  const made = [];
+  for (const side of ['left', 'right']) {
+    const bone = vrm.humanoid.getRawBoneNode(side + 'LowerLeg');
+    if (!bone) continue;
+    const _v = new THREE.Vector3();
+    const shape = {
+      type: 'sphere', inside: false, offset: new THREE.Vector3(0, 0, 0), radius: RAD,
+      // 与 three-vrm VRMSpringBoneColliderShapeSphere.calculateCollision 同语义
+      calculateCollision(colliderMatrix, objectPosition, objectRadius, target) {
+        target.subVectors(objectPosition, _v.setFromMatrixPosition(colliderMatrix));
+        const length = target.length();
+        const distance = length - objectRadius - this.radius;
+        if (distance < 0) { if (length > 1e-6) target.multiplyScalar(1 / length); else target.set(0, 1, 0); }
+        return distance;
+      },
+    };
+    const c = new THREE.Object3D();
+    c.name = 'KneeSafety' + (side === 'left' ? 'L' : 'R');
+    c.shape = shape;
+    c.colliderMatrix = new THREE.Matrix4();
+    c.updateWorldMatrix = function (up, down) {
+      THREE.Object3D.prototype.updateWorldMatrix.call(this, up, down);
+      this.colliderMatrix.copy(this.matrixWorld);
+    };
+    c.updateColliderMatrix = function () { this.colliderMatrix.copy(this.matrixWorld); };
+    try { bone.add(c); c.updateWorldMatrix(true, false); } catch (e) { continue; }
+    made.push({ side: side, group: { name: 'KneeSafetyGroup' + (side === 'left' ? 'L' : 'R'), colliders: [c] } });
+  }
+  if (!made.length) return 0;
+  // 只挂到裙摆链：数字 Strip（本模型裙骨叫 Strip 02/06/…）、Skirt/裙/ドレス/裾 等
+  let nChains = 0, nJoints = 0;
+  for (const ch of springChains()) {
+    if (!SPRING_SKIRT_CHAIN.test(String(ch.name || ''))) continue;
+    nChains++;
+    for (const j of ch.joints) {
+      if (!j) continue;
+      let arr = j.colliderGroups;
+      if (!Array.isArray(arr)) { try { j.colliderGroups = arr = []; } catch (e) { arr = null; } }
+      if (!arr) continue;
+      for (const m of made) { try { if (arr.indexOf(m.group) < 0) arr.push(m.group); } catch (e) { } }
+      nJoints++;
+    }
+  }
+  try {
+    postLog('info', '膝部安全碰撞球：' + made.length + ' 个（左/右，半径 ' + RAD + '）'
+      + '｜挂到裙摆 ' + nChains + ' 条链 / ' + nJoints + ' 个关节'
+      + (nChains
+        ? '（蹲下时膝盖会把裙摆顶开）'
+        : ('（**没匹配到裙摆链**；现有链前 8 条：' + springChains().slice(0, 8).map(c => c.name).join('、') + '）')));
+  } catch (e) { }
+  return made.length;
 }
 // ★★★ 只塞**求解器真正读的那个列表**：`joint.colliderGroups`（three-vrm 3.4.0 源码 5387 行 `_collision` 里
 //   遍历的就是它；`settings.colliderGroups` 只是 VRM 文件里的定义数据，求解器**根本不读** —— 上一版就是塞错地方，
@@ -4031,72 +4351,41 @@ window.petTouchInfo = function () {
 
 function syncSpringColliders() {
   touchTick();                                   // ★ 鼠标触摸（每帧；内部自带开关/能力判断，关着就是空转）
-  if (!vrmPhysicsOn || !vrm || !vrm.springBoneManager) return;
+  // ★★ 模型碰撞体的矩阵刷新已移到 `_springStepWrapped` 的入口 —— 必须在 `humanoid.update()`
+  //   之后（当前姿势已写到 raw 骨）、`springBoneManager.update()` 之前。
+  //   旧代码在这里（vrm.update 之前）刷新：那时 raw 骨还是**上一帧**的姿势（当前帧只写在 normalized 骨上），
+  //   刷出来的是旧值，随后 humanoid.update 把 raw 骨改到当前姿势、manager 又不会刷新 colliderMatrix
+  //   ⇒ 碰撞球永远比腿慢一帧。20~30fps 下高抬腿一帧跳 50~90°，球还在旧位置 = 裙子不被顶起、腿直接穿过。
+}
+
+// ---- ★★ 求解前刷新碰撞体矩阵（真正治"高抬腿/大幅度动作裙子穿模"）----
+// three-vrm 的 `VRMSpringBoneManager.update()` 只更新弹簧骨祖先骨的世界矩阵，
+// **不会逐个调用 collider.updateWorldMatrix** ⇒ 碰撞体的 `colliderMatrix` 还是上一帧
+// `renderer.render → scene.updateMatrixWorld` 留下的旧值。把它放到求解入口，
+// 碰撞球才和当前腿/身体姿势同步（Blender 的物理每帧先同步碰撞体，所以没这个滞后）。
+// 开销：父骨去重后各刷一次 + 每个碰撞体刷自身（矩阵运算，几百个量级，可接受）。
+let _colliderNowLoggedFor = null;
+function syncSpringColliderMatricesNow() {
+  if (!vrm || !vrm.springBoneManager) return 0;
   let groups;
-  try { groups = vrm.springBoneManager.colliderGroups; } catch (e) { return; }
-  if (!groups || !groups.length) return;
-  if (!_springColliderChecked) {
-    // 首次：先量"它到底有多过期"，再同步（顺便把这一帧同步掉）—— 这条日志就是"做动作穿模"的直接证据
-    _springColliderChecked = true;
-    try {
-      let n = 0, stale = 0, maxd = 0;
-      for (const g of groups) for (const c of (g && g.colliders) || []) {
-        if (!c || !c.colliderMatrix || typeof c.updateWorldMatrix !== 'function') continue;
-        const b = c.colliderMatrix.elements, bx = b[12], by = b[13], bz = b[14];
-        c.updateWorldMatrix(true, false);
-        const a = c.colliderMatrix.elements;
-        const d = Math.sqrt((a[12] - bx) * (a[12] - bx) + (a[13] - by) * (a[13] - by) + (a[14] - bz) * (a[14] - bz));
-        n++; if (d > 1e-4) { stale++; if (d > maxd) maxd = d; }
-      }
-      if (n) postLog('info', '弹簧骨碰撞体同步：共 ' + n + ' 个／过期 ' + stale + ' 个（最大偏差 ' + maxd.toFixed(3) + '）'
-        + (stale
-          ? ' ⇒ 每帧全量同步（过期的碰撞球不跟着腿走，做动作就会穿模）'
-          : ' ⇒ 求解器自己每帧就在更新它们（实测偏差 0）⇒ 改走"抽样体检"，不再每帧全量跑'));
-    } catch (e) { }
-    return;
+  try { groups = vrm.springBoneManager.colliderGroups; } catch (e) { return 0; }
+  if (!groups || !groups.length) return 0;
+  const seen = new Set();
+  let n = 0;
+  for (const g of groups) for (const c of (g && g.colliders) || []) {
+    if (!c || typeof c.updateWorldMatrix !== 'function') continue;
+    const p = c.parent;
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      try { p.updateWorldMatrix(true, false); } catch (e) { }   // 父骨从根向下刷一次（去重）
+    }
+    try { c.updateWorldMatrix(false, false); n++; } catch (e) { }   // 自己刷一次 ⇒ override 顺带写 colliderMatrix
   }
-  // ★★ 2026-10-14 第四轮（用户："依旧有略微卡顿"）：实测"过期 0 个（偏差 0.000）" ⇒ 这些碰撞体的世界矩阵
-  //   每帧已经由 three-vrm 自己的 ancestors 机制更新过了（我们自造的球也在其中，见 _insertJointSort），
-  //   原来这里**每帧再全量扫 447 次** `updateWorldMatrix(true, false)`（true = 递归整条父链）纯属白烧 CPU。
-  //   ⇒ 快路径：每 2 秒抽 24 个做"体检"（记旧值→强制刷新→比偏差）；一旦发现真过期，**永久切回**每帧全量。
-  const nowC = nowS_();
-  if (_springColliderFast) {
-    if (nowC - _springColliderCheckT < 2) return;
-    _springColliderCheckT = nowC;
-    try {
-      let i = 0, stale = 0, maxd = 0;
-      const total = (() => { let t = 0; for (const g of groups) t += ((g && g.colliders && g.colliders.length) || 0); return t; })();
-      const step = Math.max(1, Math.floor(total / 24));
-      for (const g of groups) for (const c of (g && g.colliders) || []) {
-        if (!c || !c.colliderMatrix || typeof c.updateWorldMatrix !== 'function') continue;
-        if ((i++ % step) !== 0) continue;
-        const b = c.colliderMatrix.elements, bx = b[12], by = b[13], bz = b[14];
-        c.updateWorldMatrix(true, false);
-        const a = c.colliderMatrix.elements;
-        const d = Math.sqrt((a[12] - bx) * (a[12] - bx) + (a[13] - by) * (a[13] - by) + (a[14] - bz) * (a[14] - bz));
-        // ★ v11.36c 阈值 1e-4 → **2e-3（2mm）**：旧阈值只有 0.1mm，角色**站着微晃 / 弹簧骨自然摆动**
-        //   就会超标（日志实证：`过期 6 个（最大偏差 0.000）`）⇒ 一旦触发就**永久**切回"每帧全量刷
-        //   447 个碰撞体"，正好在跳舞这种最需要 CPU 的时候白烧 447 次 updateWorldMatrix（递归整条父链）。
-        //   碰撞球滞后 2mm 以内根本不影响观感（穿模要先到厘米级），2mm 才算真过期。
-        if (d > 2e-3) { stale++; if (d > maxd) maxd = d; }
-      }
-      // ★ v11.36c：还要**连续两次**判过期才切（弹簧骨单帧抽一下就够误判了，别一次就判死刑）。
-      if (stale) {
-        _springColliderStaleHits++;
-        if (_springColliderStaleHits >= 2) {
-          _springColliderFast = false;
-          postLog('warn', '弹簧骨碰撞体抽样体检发现过期 ' + stale + ' 个（最大偏差 ' + maxd.toFixed(3) + '）⇒ 已切回每帧全量同步');
-        }
-      } else if (_springColliderStaleHits > 0) {
-        _springColliderStaleHits = 0;
-      }
-    } catch (e) { }
-    return;
+  if (n && _colliderNowLoggedFor !== vrm) {
+    _colliderNowLoggedFor = vrm;
+    try { postLog('info', '弹簧骨碰撞体：求解前每帧刷新 ' + n + ' 个／父骨 ' + seen.size + ' 根（跟随当前姿势，消除一帧滞后）'); } catch (e) { }
   }
-  try {
-    for (const g of groups) for (const c of (g && g.colliders) || [])
-      if (c && typeof c.updateWorldMatrix === 'function') c.updateWorldMatrix(true, false);
-  } catch (e) { }
+  return n;
 }
 
 // ---- 姿势"瞬跳"看门狗（**自动排查**，不需要人盯着看是"哪一下"）----
@@ -4425,6 +4714,39 @@ function frameCamera(scale, camDist) {
 
 const reframe = fitCamera;   // 兼容旧调用（姿势切换时重新取景）
 
+// ---- 取景越界自检（"自适应能力跑哪去了"）----
+// 只看真正会露馅的几个点：头顶 + 两只脚踝（这些是**蒙皮后的实际位置**，比包围盒可靠）。
+// 任一落到视口外 2% 以上 ⇒ 自动重取景一次（节流 400ms；sit/lieback 本来就要裁腿，跳过）。
+// 为什么不用 Box3 角点：透视下靠近相机的角会放大，正常取景也可能"角出画" ⇒ 会误触发、一直重取景。
+let _fitGuardV = null, _fitGuardLogT = 0;
+function fitGuardTick() {
+  try {
+    if (!vrm || !camera || !vrm.humanoid || !groundInited) return;
+    if (currentPose === 'sit' || currentPose === 'lieback') return;
+    if (fitSafeFill > 1.01) return;   // 用户主动把安全框调到 >100% ⇒ 明确允许切边，别自作主张重取景
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now - fitGuardT < 400) return;
+    fitGuardT = now;
+    _fitGuardV = _fitGuardV || new THREE.Vector3();
+    let out = false;
+    for (const bn of ['head', 'leftFoot', 'rightFoot']) {
+      const b = (vrm.humanoid.getRawBoneNode ? vrm.humanoid.getRawBoneNode(bn) : null)
+        || vrm.humanoid.getNormalizedBoneNode(bn);
+      if (!b) continue;
+      b.getWorldPosition(_fitGuardV).project(camera);
+      if (!isFinite(_fitGuardV.x) || !isFinite(_fitGuardV.y)) continue;
+      if (Math.abs(_fitGuardV.x) > 1.02 || Math.abs(_fitGuardV.y) > 1.02) { out = true; break; }
+    }
+    if (out) {
+      reframe();
+      if (now - _fitGuardLogT > 3000) {
+        _fitGuardLogT = now;
+        try { postLog('info', '取景自适应：头顶/脚踝越界 ⇒ 自动重取景（大小/转身/根位移后不再出画）'); } catch (e) { }
+      }
+    }
+  } catch (e) { }
+}
+
 // ---- 上报宠物轮廓 / 落座 ----
 // 宠物在“窗口内”的可见矩形（CSS 像素）用于鼠标穿透：只有矩形内不穿透，空白穿透给桌面；
 // dock=true（坐姿）时 C# 把接触线落到任务栏顶（腿垂在任务栏上）。窗口尺寸固定，不再收缩。
@@ -4554,6 +4876,8 @@ async function loadVRM(url, motions, opts) {
   }
   try { VRMUtils.removeUnnecessaryVertices(gltf.scene); } catch (e) { console.warn('removeUnnecessaryVertices 跳过', e); }
   try { VRMUtils.combineSkeletons(gltf.scene); } catch (e) { console.warn('combineSkeletons 跳过', e); }
+  // ★ 膝部安全碰撞球（治"下压身体/蹲跪时裙摆嵌进膝盖"；见 ensureKneeColliders）
+  try { ensureKneeColliders(); } catch (e) { console.warn('膝部安全碰撞球跳过', e); }
   // ★ v11.8：模型就绪 ⇒ 立刻接上「弹簧骨子步」包装（默认 2 步 ≈1/120）与应用「材质观感」开关
   //   子步**打一条日志**（不是静默）："到底有没有生效"要能从日志一眼看到，不然只能靠手感猜。
   try { applySpringSubSteps(undefined, false); } catch (e) { }
@@ -4707,9 +5031,9 @@ async function loadMMD(url, motions, opts) {
   // ★★ v11.48（用户："换 PMX 模型连人物都加载不出来"）：
   //   两条加载路径本来就是**分开**的，而它们取文件的方式不同 ——
   //     · VRM：`readLocalFile(url)`（旧版是 Electron fs 直读磁盘，Alife 5 改走 /disk/）⇒
-  //       路径带中文/空格从来没出过问题（你这台一直能换 VRM 就是这个原因）；
+  //       路径带中文/空格从来没出过问题（这条路径一直没问题就是这个原因）；
   //     · MMD/PMX：`MMDLoader.load(url)` ⇒ 内部 `FileLoader.load` ⇒ **fetch(url)** ⇒
-  //       页面是 http://127.0.0.1:… 去取 `file:///E:/…/锁瞑/鸣潮_锁暝.pmx`，
+  //       页面是 http://127.0.0.1:… 去取 `file:///…/模型目录/model.pmx`，
   //       协议跨了 + 路径还带中文 ⇒ `TypeError: Failed to fetch`（日志实证）。
   //   修法：装一个 **LoadingManager 的 URL 改写器**（见 installFileUrlBridge）：
   //   FileLoader **真正去取字节**那一步把 file:// 换成宿主本机服务的 /disk/… ⇒ 中文/空格/协议都无所谓；
@@ -4782,7 +5106,7 @@ function collectExpressions() {
 }
 // ---- 当前模型「真正能播」的动作（唯一可信清单）----
 // 为什么必须有这层过滤：动作库常把 .vmd 与 .vrma 混放在同一批目录里（实测
-// `E:\Nyalume-…\手势舞比心\动作.vmd`），而解析入口 loadOneVrmClip 开头就是
+// `动作库\手势舞比心\动作.vmd`），而解析入口 loadOneVrmClip 开头就是
 // `if (m.kind !== 'vrma') return null` —— **静默返回**。不过滤的后果（用户实测）：
 //   含"播不了的名字"的清单被报给宿主 → 进 AI 常驻信息 → AI 调 <motion option="手势舞比心/动作"/>
 //   → C# 校验通过（SupportedMotions 里确实有它）→ 前端也进了播放函数 →
@@ -5117,6 +5441,33 @@ let embodiedReady = false;
 let embodiedT = 0;
 let embodiedQueue = [];        // 真实帧队列（生成端注入）
 let embodiedQueueIsHold = false;   // 队列里的剪辑是不是造型面板的"保持预览"（新动作不该排在它后面）
+let embodiedStaticHold = false;    // ★ P0-A1：静态保持（造型存档/面板预览）—— 只留 1 帧，每帧重复写，不再排 800 帧
+let embodiedStaticHoldAt = 0;      // 最后一次“续持”时间：面板每 2s 续一次；超过 90s 无续持自动释放
+const EMBODIED_STATIC_HOLD_MAX_MS = 90000;
+let embodiedStaticSuspended = false; // ★ 生成动作期间挂起静态保持的根位移/转身（动作结束后恢复）
+// ★ P1B：当前动作所有者。同一时刻只允许一个动作层写骨骼：
+//   'clip'（点播/舞蹈） / 'embodied'（bodyact） / 'ardy'（生成动作） / 'hold'（静态保持） / null（待机）
+let motionActionOwner = null;
+function motionOwnerAfterClip() { return (embodiedStaticHold && embodiedQueue.length) ? 'hold' : null; }
+
+// ★ 90s 自动释放：面板关闭/存档恢复后不再续持时，静态保持不能永久占着骨骼（会挡住待机）。
+setInterval(function () {
+  try {
+    if (!embodiedStaticHold) return;
+    if (performance.now() - embodiedStaticHoldAt < EMBODIED_STATIC_HOLD_MAX_MS) return;
+    embodiedStaticHold = false; embodiedStaticSuspended = false;
+    embodiedQueue = []; embodiedQueueIsHold = false; embodiedPlayT = 0; embodiedRootY = 0;
+    if (motionActionOwner === 'hold') setMotionActionOwner(null, '静态保持超时');
+    if (!ardyActive) { try { embodiedYieldOff(); } catch (e) { } }
+    postLog('info', '静态保持已 90 秒无续持 → 自动释放，恢复待机');
+  } catch (e) { }
+}, 1000);
+function setMotionActionOwner(owner, why) {
+  if (motionActionOwner === owner) return;
+  const prev = motionActionOwner;
+  motionActionOwner = owner;
+  try { postLog('info', '· 动作所有者：' + (prev || '无') + ' → ' + (owner || '无') + (why ? '（' + why + '）' : '')); } catch (e) { }
+}
 let embodiedPlayT = 0;         // 播放头（帧）
 let embodiedFps = 20;
 let embodiedSmoothQ = {};      // 本层“上一次写入”的骨骼值；平滑基于它，而不是骨骼当前值
@@ -5138,14 +5489,20 @@ function scheduleArdyWarmup() {
     ardyWarmupTimer = null;
     if (ardyWarmupTried || !embodiedOn()) return;
     // ★★ 2026-10-14 第四轮（用户："依旧有略微卡顿、不流畅丝滑"）：预热要在 Worker 里读 684MB 权重 +
-    //   建 WebGPU 会话，抢 CPU 的那十几秒主线程帧率会掉（日志现场：`瞬跳捕获 … fps≈34` 正落在预热时间窗内，
-    //   同一帧弹簧骨跳 34°）。所以：**你刚动过（8 秒内）就先让一让**，10 秒后再试；最多退避 6 次（≈1 分钟），
-    //   之后无论如何都跑 —— 否则"用户一直在动 ⇒ 永远不预热 ⇒ 第一次 gen 又等 6~12 秒"。
+    //   建 WebGPU 会话，抢 CPU 的那十几秒主线程帧率会掉。
+    // ★ P0-A3（日志实证）：旧判据 `idleT - cursorSeenT < 8` 会把**光标悬停**也算成“正在操作”，
+    //   日志里连续退避 4 次（40s），第一次 gen 仍要等 6~12s。现在只避让**真正会打断的动作**：
+    //   拖拽、非保持的具身动作队列、正在播的生成动作；光标悬停/静态保持/待机 VRMA 不再阻塞预热。
+    //   最多退避 2 次（20s）后强制预热，避免“用户一直在动 ⇒ 永远不预热”。
     let busy = false;
-    try { busy = (idleT - (cursorSeenT || -99) < 8); } catch (e) { }
-    if (busy && ardyWarmupWaitN < 6) {
+    try {
+      busy = (typeof dragAction !== 'undefined' && !!dragAction)
+        || (embodiedQueue && embodiedQueue.length && !embodiedQueueIsHold)
+        || (typeof ardyActive !== 'undefined' && !!ardyActive);
+    } catch (e) { busy = false; }
+    if (busy && ardyWarmupWaitN < 2) {
       ardyWarmupWaitN++;
-      postLog('info', '生成式动作预热：你正在操作，先让一让（第 ' + ardyWarmupWaitN + ' 次退避）⇒ 10 秒后再试');
+      postLog('info', '生成式动作预热：有动作在播，先让一让（第 ' + ardyWarmupWaitN + ' 次退避）⇒ 10 秒后再试');
       scheduleArdyWarmup();
       return;
     }
@@ -5730,6 +6087,10 @@ function embodiedYieldOff() {
 //   aim 与骨骼长度、模型比例、rest 偏移全都无关，父骨转完后子骨的轴自动跟上。
 // 与具身动作共用让位机制（embodiedYieldOn/Off）：播放时 mixer 交出骨骼，播完自动还回去。
 let ardyFrames = [], ardyChildOf = {}, ardyFps = 20, ardyPlayT = 0, ardyActive = false, ardyBlend = 0, ardyLast = null;
+// ★ 脚 IK 的"最后一帧接触"：收尾淡出时队列已空，但脚还钉在锚点上 ——
+//   必须沿用最后一帧的 footContacts，否则淡出这几帧会切回"按速度自判"，脚可能突然松一下。
+let ardyLastContact = null;
+let _ardyContactN = 0;   // 本条消息里带 contact 的帧数（只用于入队日志）
 let ardyYieldHoldLogged = false;   // 「占用中不交还」只提示一次，避免刷屏
 let _ardyVA, _ardyVB, _ardyVT, _ardyQ, _ardyPQ, _ardyInv;
 let ardyHipsRest = null;        // 根位移用：本片段开始时 hips 的静止位置（交还时复位）
@@ -5739,7 +6100,11 @@ function ardyIngest(msg) {
   if (!msg) return;
   if (msg.fps) ardyFps = Math.max(1, Math.min(120, +msg.fps || 20));
   const fr = Array.isArray(msg) ? msg : (msg.frames || []);
+  if (!fr.length) return;
+  const _append = (msg && msg.mode === 'append') && ardyActive;   // 4A：续接块，不重置播放状态
+  if (!_append) ardyFrames = [];                                    // 新片段/替换：旧队列必须清掉
   let n = 0;
+  _ardyContactN = 0;
   for (const f of fr) {
     if (!f || !f.aims || !f.aims.length) continue;
     const dirs = {};
@@ -5752,16 +6117,45 @@ function ardyIngest(msg) {
       if (a.childBone) ardyChildOf[a.bone] = a.childBone;
     }
     if (Object.keys(dirs).length === 0) continue;
-    ardyFrames.push({ dirs: dirs, yaw: yaw, root: f.root || null }); n++;
+    // ★ 4A：把 footContacts 也带上 —— 否则脚 IK 永远拿不到接触数据，只能“按速度自判”
+    //   （日志实证：320 项接触数据到了客户端，脚 IK 却写 `落地数据=按速度自判`）。
+    ardyFrames.push({ dirs: dirs, yaw: yaw, root: f.root || null, contact: f.contact || null }); n++;
+    if (f.contact) { _ardyContactN++; ardyLastContact = f.contact; }
   }
   if (ardyFrames.length > 900) ardyFrames.splice(0, ardyFrames.length - 900);   // 上限防内存涨
   if (n > 0) {
+    const _wasPlaying = _append;   // 续接块：不能把当前根位移当成静止位；替换块要重记
+    // ★ 新片段起点：先记下 hips 的**未加约束**静止位（支撑/平衡层会改同一个 position，
+    //   若等第一次 root 帧再记，记到的可能已经带了上一帧的下沉量）。
+    if (!_wasPlaying) {
+      try {
+        const _h0 = (vrm && vrm.humanoid) ? vrm.humanoid.getNormalizedBoneNode('hips') : null;
+        ardyHipsRest = _h0 ? _h0.position.clone() : null;
+      } catch (eH0) { ardyHipsRest = null; }
+      // 新片段：脚锚点也要清 —— 否则第一帧的 IK 会把脚拽回**上一个动作**的落点
+      footAnchor.left = null; footAnchor.right = null;
+      footAnchor.leftPrev = null; footAnchor.rightPrev = null;
+      ardyLastContact = null;   // 上一段的接触数据不能带进新动作
+    }
     // ★ 骨骼只有一套：生成动作开始前，把**具身层**的队列清掉。
     //   否则两层每帧互相覆盖（实测症状：造型拖着不动、膝盖被覆盖回直立、全身抽搐）。
     //   规则：**最新一次明确请求赢** —— 生成动作来了，之前顶住的姿势让位。
-    embodiedQueue = []; embodiedPlayT = 0; embodiedPelvicQ = null; _embPinRawActive = false;
+    // ★ P0-A1：静态保持不消费队列 —— 生成动作期间由 applyEmbodiedRetarget 的让位分支把它挂起，
+    //   动作结束后自动接回（造型不会因为一次 AI 动作就永久丢失）。
+    if (!embodiedStaticHold) {
+      embodiedQueue = []; embodiedPlayT = 0; embodiedPelvicQ = null; _embPinRawActive = false;
+      embodiedQueueIsHold = false;
+    } else {
+      embodiedStaticSuspended = true;   // 静态保持保留，但根位移/转身先挂起，避免和生成层抢骨盆
+    }
+    if (!_append) {
     ardyActive = true; ardyBlend = 0; ardyPlayT = 0; ardyLast = null; ardySmoothDir = {}; ardyYieldHoldLogged = false;
+    // 新片段：支撑/平衡偏移与膝盖极向状态从零开始（极向会在头几帧从 ardy 的膝平面收敛到正前方）
+    ardySupportReset();
+    footPole.leftReady = false; footPole.rightReady = false;
+    setMotionActionOwner('ardy', '生成动作');
     embodiedYieldOn();
+    } else { ardyActive = true; }
     // ★ 关键：头部/脊椎"光标追踪"与待机动作的开关条件是 (danceDisableTrack && dancingNow)，
     //   它们**不看** embodiedYielding。而 embodiedYieldOn 里写了 dancingNow=false →
     //   追踪会在生成动作期间继续写头/脊椎/上身，和本层 aim 每帧互相覆盖 =
@@ -5771,7 +6165,8 @@ function ardyIngest(msg) {
   // ★★ v11.44：日志措辞**必须避开 PROBE_HINTS 里的 `ardy`** —— 带这三个字母会被闸门整行静默，
   //   于是生成动作"入队/被停止/播完"全程不可见（日志里只剩"生成层=false"，根本查不出谁掐的）。
   //   和状态行里用"生成层"是同一个道理。
-  postLog('info', '生成动作帧已入队：本次 ' + n + ' 帧，队列共 ' + ardyFrames.length + ' 帧');
+  postLog('info', '生成动作帧已入队：本次 ' + n + ' 帧' + (_append ? '（续接）' : '（替换）') + '，队列共 ' + ardyFrames.length + ' 帧'
+    + '｜落地数据 ' + _ardyContactN + '/' + n + (_ardyContactN ? ' 帧带 footContacts（脚 IK 用接触判定）' : '（缺 contact ⇒ 脚 IK 按速度自判）'));
 }
 // ★ v11.45 逃生开关：控制台里 `petTrueHinge(false)` 立刻退回旧的肘轴（不用改代码、不用重载）；
 //   `petTrueHinge(true)` 再开回来。万一真铰链把某个预设弄歪了，这就是一键回滚。
@@ -5794,6 +6189,8 @@ window.ardyFeed = ardyIngest;
 window.ardyStopArdy = function (why) {
   const _was = ardyActive;
   ardyFrames = []; ardyLast = null; ardyActive = false; ardyBlend = 0; embodiedYieldOff();
+  embodiedStaticSuspended = false;
+  if (motionActionOwner === 'ardy') setMotionActionOwner(motionOwnerAfterClip(), '生成动作停止');
   if (_was) postLog('info', '生成动作已停止（原因：' + (why || '未说明') + '）');
 };
 
@@ -6127,7 +6524,21 @@ function ardyAimApply(pose, k, dt) {
 //   ③ 脚一抬起（速度超阈值）立即解除锚点 ⇒ 不会把抬腿动作拽住；
 //   ④ 任何异常都被 catch 吞掉并只记一行 ⇒ 绝不影响正常播放。
 let ardyFootIK = 0;
+// 膝盖极向外侧分量：0=纯正前（最不罗圈）；0.02=轻微自然外八；0.04~0.08=更明显。
+// 控制台 `petKneeOut(0)` / `petKneeOut(0.04)` 可即时调，不用重载。
+let ardyKneeOut = 0.02;
+window.petKneeOut = function (v) {
+  if (v === undefined) return ardyKneeOut;
+  ardyKneeOut = Math.max(0, Math.min(0.12, +v || 0));
+  try { postLog('info', '脚部 IK 膝盖外展 = ' + (ardyKneeOut * 100).toFixed(1) + '%'); } catch (e) { }
+  return ardyKneeOut;
+};
 const footAnchor = { left: null, right: null, leftPrev: null, rightPrev: null };
+// ★ 膝盖极向的**时间状态**（世界系单位向量）：逐帧缓入目标，而不是每帧直接换 pole。
+//   为什么：pole 在"正前方"与"当前弯曲平面"之间切换时，哪怕只差一帧也会让膝盖翻面
+//   （日志里 `弹簧骨·Upper_legL001 单帧跳 82°/176°` 就是腿骨单帧大转的连带反应；
+//    这条链挂在腿骨上，腿一转它就跟着甩）。
+const footPole = { left: null, right: null, leftReady: false, rightReady: false };
 let footIKLogSig = '';
 const _fIK = { q: null, pq: null };     // ★ 延迟创建：模块顶层执行时 THREE 可能还没加载（懒建更安全）
 function _fIKBones(side) {
@@ -6144,8 +6555,12 @@ function footIKApplyLeg(side, weight, dt, hint) {
   if (!B.up || !B.lo || !B.ft) return { planted: false, err: '缺骨' };
   const scaleRef = Math.max(1e-4, (window.EmbodiedRig && window.EmbodiedRig.hipToHead) || 0.5);
   const P = (b) => b.getWorldPosition(new THREE.Vector3());
-  vrm.scene.updateMatrixWorld(true);
+  // ★ 只刷新这条腿的链（父链向上 + 子树向下），不再每次 `vrm.scene.updateMatrixWorld(true)`：
+  //   一帧里腿 IK 会被调 2 次、每次原来有 3~6 次全场景矩阵刷新 ⇒ 18fps 时这里就是纯浪费。
+  B.up.updateWorldMatrix(true, true);
   const hip0 = P(B.up), knee0 = P(B.lo), ankle0 = P(B.ft);
+  // ★ 脚 IK 只该动“位置”，不该把脚掌朝向一起拧歪：记下 IK 前的脚世界朝向，最后按权重还原。
+  const footWorldBefore = B.ft.getWorldQuaternion(new THREE.Quaternion());
   // 1) 落地判定
   const prevKey = side + 'Prev';
   const prev = footAnchor[prevKey];
@@ -6163,9 +6578,51 @@ function footIKApplyLeg(side, weight, dt, hint) {
   d = Math.max(Math.abs(L1 - L2) * 1.02 + 1e-4, Math.min((L1 + L2) * 0.995, d));   // 夹到可达范围
   const axis = target.clone().sub(hip0).normalize();
   const kneeOff = knee0.clone().sub(hip0);
-  const perp = kneeOff.clone().sub(axis.clone().multiplyScalar(kneeOff.dot(axis)));  // 保留原弯曲平面
+  // ★ 膝盖极向：不再“保留 ardy 当前的弯曲平面”（那会把 ardy 的膝盖外八/罗圈腿原样锁住）。
+  //   pole = 模型正前方 + `ardyKneeOut` 的外侧分量（默认 2%，可控制台调）。
+  //   0 = 纯正前方（最不罗圈，但可能偏“内扣”）；0.04~0.08 = 更接近自然站姿的外八。
+  //   腿部与前方几乎平行（抬腿/后摆）时 pole 退化 → 才退回“当前弯曲平面”。
+  const rigP = window.EmbodiedRig || {};
+  const _fwd = rigP.fwd || [0, 0, 1];
+  const _lat = rigP.left || rigP.lateral || [1, 0, 0];
+  const _sideSign = side === 'left' ? 1 : -1;
+  const poleBase = new THREE.Vector3(
+    _fwd[0] + _lat[0] * ardyKneeOut * _sideSign,
+    _fwd[1] + _lat[1] * ardyKneeOut * _sideSign,
+    _fwd[2] + _lat[2] * ardyKneeOut * _sideSign
+  );
+  let perp;
+  const poleTarget = poleBase.clone().normalize();
+  // 极向连续性：初次取"当前膝盖弯曲平面"（= ardy 刚摆出来的），之后每帧向目标缓入
+  //   （时间常数 0.22s ⇒ 换动作开头一两帧不会翻面，之后自然收敛到正前方极向）。
+  let ps = footPole[side];
+  if (!ps) { ps = footPole[side] = new THREE.Vector3(); }
+  if (!footPole[side + 'Ready']) {
+    const init = kneeOff.clone().sub(axis.clone().multiplyScalar(kneeOff.dot(axis)));
+    if (init.lengthSq() > 1e-10) ps.copy(init.normalize()); else ps.copy(poleTarget);
+    footPole[side + 'Ready'] = true;
+  } else {
+    const kp = (dt > 0) ? (1 - Math.exp(-dt / 0.22)) : 0.4;
+    ps.lerp(poleTarget, kp);
+    if (ps.lengthSq() < 1e-10) ps.copy(poleTarget); else ps.normalize();
+  }
+  perp = ps.clone().sub(axis.clone().multiplyScalar(ps.dot(axis)));
+  if (perp.lengthSq() < 1e-8) {
+    perp = kneeOff.clone().sub(axis.clone().multiplyScalar(kneeOff.dot(axis)));  // 退化：保留当前平面
+  }
   if (perp.lengthSq() < 1e-10) perp.set(0, 0, 1);
   perp.normalize();
+  // ★ 膝盖朝前失败时的兜底：若新膝盖方向与“髋→脚”几乎反向（腿被折到身后），
+  //   不能硬掰到前面（反关节）——把极向状态**缓缓**转向当前弯曲平面，而不是当帧瞬切。
+  if (perp.dot(kneeOff) < -0.25 * kneeOff.length()) {
+    const fallback = kneeOff.clone().sub(axis.clone().multiplyScalar(kneeOff.dot(axis)));
+    if (fallback.lengthSq() > 1e-10) {
+      ps.lerp(fallback.normalize(), 0.3);
+      perp = ps.clone().sub(axis.clone().multiplyScalar(ps.dot(axis)));
+      if (perp.lengthSq() < 1e-10) perp.copy(fallback);
+      perp.normalize();
+    }
+  }
   const aProj = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
   const hgt = Math.sqrt(Math.max(0, L1 * L1 - aProj * aProj));
   const kneeNew = hip0.clone().add(axis.clone().multiplyScalar(aProj)).add(perp.clone().multiplyScalar(hgt));
@@ -6179,20 +6636,24 @@ function footIKApplyLeg(side, weight, dt, hint) {
     bone.updateMatrixWorld(true);
   };
   aim(B.up, knee0.clone().sub(hip0), kneeNew.clone().sub(hip0));
-  vrm.scene.updateMatrixWorld(true);
   const knee1 = P(B.lo);
   aim(B.lo, P(B.ft).clone().sub(knee1), target.clone().sub(knee1));
-  vrm.scene.updateMatrixWorld(true);
   // 4) 迭代一次（两骨解析解一次就够，迭代吃掉数值误差；脚到不了目标时 err 会告诉我们）
   let ankle1 = P(B.ft);
   if (ankle1.distanceTo(target) > scaleRef * 0.004) {
     const hip2 = P(B.up), knee2 = P(B.lo);
     aim(B.up, knee2.clone().sub(hip2), kneeNew.clone().sub(hip2));
-    vrm.scene.updateMatrixWorld(true);
     const knee3 = P(B.lo);
     aim(B.lo, P(B.ft).clone().sub(knee3), target.clone().sub(knee3));
-    vrm.scene.updateMatrixWorld(true);
     ankle1 = P(B.ft);
+  }
+  // 5) 脚掌朝向还原：IK 改的是踝位置（大腿/小腿），脚骨本身不该被带着滚/翘。
+  //    按 IK 权重把脚的世界朝向 slerp 回 IK 前的值 —— 只改朝向，不改踝位置。
+  if (weight > 0.001 && footWorldBefore && B.ft.parent) {
+    const pq = B.ft.parent.getWorldQuaternion(new THREE.Quaternion());
+    const targetLocal = pq.invert().multiply(footWorldBefore);
+    B.ft.quaternion.slerp(targetLocal, Math.max(0, Math.min(1, weight)));
+    B.ft.updateMatrixWorld(true);
   }
   return { planted: true, speed: speed, held: true, err: ankle1.distanceTo(target) };
 }
@@ -6206,7 +6667,8 @@ function ardyFootIKApply(dt, k) {
       return;
     }
     const fr = (typeof ardyFrames !== 'undefined' && ardyFrames && ardyFrames[0]) || null;
-    const con = (fr && fr.contact) || null;
+    // 队列空 = 收尾淡出：沿用最后一帧的接触（否则这几帧切回速度自判，脚会松一下）
+    const con = (fr && fr.contact) || ardyLastContact || null;
     const w = Math.max(0, Math.min(1, ardyFootIK)) * Math.max(0, Math.min(1, (k === undefined ? 1 : k)));
     const rl = footIKApplyLeg('left', w, dt, con ? !!con.l : null);
     const rr = footIKApplyLeg('right', w, dt, con ? !!con.r : null);
@@ -6214,13 +6676,220 @@ function ardyFootIKApply(dt, k) {
     if (sig !== footIKLogSig) {
       footIKLogSig = sig;
       postLog('info', '脚部 IK：左=' + (rl.planted ? '钉住' : '摆动') + '（' + (rl.held ? ('保持 err ' + (rl.err || 0).toFixed(3)) : '仅判定') + '）'
-        + ' 右=' + (rr.planted ? '钉住' : '摆动') + '｜权重 ' + w.toFixed(2) + '｜落地数据=' + (con ? 'ardy footContacts' : '按速度自判'));
+        + ' 右=' + (rr.planted ? '钉住' : '摆动') + '｜权重 ' + w.toFixed(2) + '｜落地数据=' + (con ? '生成层 footContacts' : '按速度自判'));
     }
-  } catch (e) { footIKLogSig = 'err'; postLog('warn', '脚部 IK 异常（已跳过这一帧）：' + ((e && e.message) || e)); }
+    return { rl: rl, rr: rr, con: con, w: w };
+  } catch (e) { footIKLogSig = 'err'; postLog('warn', '脚部 IK 异常（已跳过这一帧）：' + ((e && e.message) || e)); return null; }
 }
 
+// ★ 4B clean-room 关节限位：只约束“上身/手臂”的局部旋转相对静止基准的锥角，
+//   不碰腿（腿已经由脚 IK 负责），避免把脚从锚点拽走。
+//   限位故意给得很宽（脊椎 60°、手臂 165°），只挡明显反关节/拧头，不做“动作审查”。
+const ARDY_JOINT_LIMITS = {
+  spine: 60, chest: 45, upperChest: 35, neck: 55, head: 65,
+  leftShoulder: 35, rightShoulder: 35,
+  leftUpperArm: 165, rightUpperArm: 165,
+  leftLowerArm: 155, rightLowerArm: 155,
+  leftHand: 80, rightHand: 80
+};
+let ardyJointLimit = 1;   // 1=开（默认），0=关；控制台 petJointLimit(0) 可一键回滚
+window.petJointLimit = function (on) {
+  ardyJointLimit = on === false || on === 0 ? 0 : 1;
+  try { postLog('info', '4B 上身关节限位 = ' + (ardyJointLimit ? '开' : '关')); } catch (e) { }
+  return ardyJointLimit;
+};
+function ardyJointLimits(weight) {
+  weight = weight * ardyJointLimit;
+  if (!(weight > 0.001) || !embodiedRestQ || !vrm || !vrm.humanoid) return;
+  const deg = Math.PI / 180;
+  for (const name in ARDY_JOINT_LIMITS) {
+    const b = vrm.humanoid.getNormalizedBoneNode ? vrm.humanoid.getNormalizedBoneNode(name) : null;
+    const rest = embodiedRestQ[name];
+    if (!b || !rest) continue;
+    let dx, dy, dz, dw;
+    try {
+      const d = rest.clone().invert().multiply(b.quaternion);
+      dx = d.x; dy = d.y; dz = d.z; dw = d.w;
+    } catch (e) { continue; }
+    if (dw < 0) { dx = -dx; dy = -dy; dz = -dz; dw = -dw; }   // 最短弧
+    const angle = 2 * Math.acos(Math.max(-1, Math.min(1, dw)));
+    const maxRad = ARDY_JOINT_LIMITS[name] * deg;
+    if (angle <= maxRad) continue;
+    const axis = new THREE.Vector3(dx, dy, dz);
+    if (axis.lengthSq() < 1e-10) continue;
+    axis.normalize();
+    const target = new THREE.Quaternion().setFromAxisAngle(axis, maxRad);
+    const clamped = rest.clone().multiply(target);
+    b.quaternion.slerp(clamped, Math.max(0, Math.min(1, weight)));
+    b.updateMatrixWorld(true);
+  }
+}
+
+// ★ 4B clean-room 第 2 版（支撑/平衡）：旧版写的是 **raw hips** —— three-vrm 每帧 humanoid.update 会把
+//   归一化 hips 的位移抄回 raw，所以那一笔在下一次 vrm.update 就被原样覆盖 ⇒ 实际是**空转**
+//   （只白白挪了弹簧骨碰撞球，画面不降）。这一版：
+//     ① 写**归一化 hips**（与 ardy 根位移同一层）⇒ 脚 IK 与画面都能看到；
+//     ② 在脚 IK **之前**应用 ⇒ 一帧只解一次 IK（旧版下沉后再解两次，18fps 时纯浪费）；
+//     ③ 目标由几何量算（髋→锚点距离 vs 腿长、COM vs 支撑面），时间常数 + 限速平滑
+//        ⇒ 不会"这一帧猛压下一帧猛抬"（那也正是腿骨单帧大跳、腿链弹簧 82°/176° 的来源）。
+const _ardySup = { drop: 0, bx: 0, bz: 0, pl: false, pr: false, err: 0, logT: -1e9, errLogT: -1e9 };
+let ardySupportOn = 1;   // 1=开（默认）；控制台 `petSupportConstraint(0)` 一键回滚（本帧起不再改 hips）
+window.petSupportConstraint = function (on) {
+  ardySupportOn = (on === false || on === 0) ? 0 : 1;
+  ardySupportReset();
+  try { postLog('info', '支撑/平衡约束 = ' + (ardySupportOn ? '开' : '关')); } catch (e) { }
+  return ardySupportOn;
+};
+function ardySupportReset() {
+  _ardySup.drop = 0; _ardySup.bx = 0; _ardySup.bz = 0;
+  _ardySup.pl = false; _ardySup.pr = false; _ardySup.err = 0;
+}
+function _supSmooth(cur, target, dt, tau, maxSpeed) {
+  const k = (dt > 0) ? (1 - Math.exp(-dt / Math.max(1e-3, tau))) : 1;
+  let v = cur + (target - cur) * k;
+  const step = maxSpeed * (dt > 0 ? dt : 0);
+  if (v - cur > step) v = cur + step; else if (cur - v > step) v = cur - step;
+  return v;
+}
+/** 世界系平移 → 归一化 hips（唯一会传导到 raw hips 的一层） */
+function ardyHipsOffsetApply(dx, dy, dz) {
+  if (!vrm || !vrm.humanoid || !THREE) return false;
+  const hips = vrm.humanoid.getNormalizedBoneNode('hips');
+  if (!hips || !hips.parent) return false;
+  const world = hips.getWorldPosition(new THREE.Vector3());
+  world.x += dx; world.y += dy; world.z += dz;
+  hips.position.copy(hips.parent.worldToLocal(world));
+  hips.updateMatrixWorld(true);
+  return true;
+}
+/** 每帧、在脚 IK **之前**调用：平滑更新"该下沉多少 / 该水平回收多少"，再写进 hips */
+function ardyHipsConstraint(dt, w) {
+  try {
+    if (!vrm || !vrm.humanoid || !THREE) return;
+    if (!ardySupportOn) { ardySupportReset(); return; }
+    const wp = Math.max(0, Math.min(1, (w === undefined ? 1 : w)));
+    if (!(wp > 0.02) || !(ardyFootIK > 0.001)) { ardySupportReset(); return; }
+    const scaleRef = Math.max(1e-4, (window.EmbodiedRig && window.EmbodiedRig.hipToHead) || 0.5);
+    const hips = vrm.humanoid.getNormalizedBoneNode('hips');
+    if (!hips) return;
+    hips.updateWorldMatrix(true, false);
+    const hipW = hips.getWorldPosition(new THREE.Vector3());
+    const boneOf = (n) => vrm.humanoid.getNormalizedBoneNode ? vrm.humanoid.getNormalizedBoneNode(n) : null;
+    const V = (b) => { try { return b ? b.getWorldPosition(new THREE.Vector3()) : null; } catch (e) { return null; } };
+
+    // ---- ① 支撑下沉：髋→锚点 超过腿长 ⇒ 髋下沉到"刚好够得着"（别把膝盖拉直锁死） ----
+    let need = 0;
+    for (const side of ['left', 'right']) {
+      if (!(side === 'left' ? _ardySup.pl : _ardySup.pr)) continue;
+      const up = boneOf(side + 'UpperLeg'), lo = boneOf(side + 'LowerLeg'), ft = boneOf(side + 'Foot');
+      if (!up || !lo || !ft) continue;
+      const pUp = V(up), pLo = V(lo), pFt = V(ft);
+      if (!pUp || !pLo || !pFt) continue;
+      const reach = pUp.distanceTo(pLo) + pLo.distanceTo(pFt);
+      const anchor = footAnchor[side] || pFt;
+      // 用**大腿根**（IK 的起点）而不是 hips 骨量距离：两者之间还有几厘米的骨盆偏移，
+      // 用 hips 会把“够不着”判大，白让角色蹲一截。
+      const over = pUp.distanceTo(anchor) - reach * 0.985;
+      if (over > need) need = over;
+    }
+    const dropTarget = Math.max(0, Math.min(scaleRef * 0.06, need * 0.85));
+    _ardySup.drop = _supSmooth(_ardySup.drop, dropTarget, dt, 0.16, scaleRef * 0.12);
+
+    // ---- ② 平衡回收：COM 水平超出支撑面 ⇒ 髋水平回收（支撑面用**锚点**，摆动脚不算支撑） ----
+    let bxTarget = 0, bzTarget = 0, comOver = 0, footSep = 0;
+    if (_ardySup.pl || _ardySup.pr) {
+      const ch = V(boneOf('chest')) || V(boneOf('upperChest'));
+      const hd = V(boneOf('head'));
+      const lf = footAnchor.left || V(boneOf('leftFoot'));
+      const rf = footAnchor.right || V(boneOf('rightFoot'));
+      if (hd && lf && rf) {
+        const com = hipW.clone().multiplyScalar(ch ? 0.55 : 0.8);
+        if (ch) com.add(ch.clone().multiplyScalar(0.3));
+        com.add(hd.clone().multiplyScalar(0.15));
+        let cx, cz, halfW, halfD;
+        if (_ardySup.pl && _ardySup.pr) {
+          cx = (lf.x + rf.x) * 0.5; cz = (lf.z + rf.z) * 0.5;
+          halfW = Math.max(scaleRef * 0.12, Math.abs(lf.x - rf.x) * 0.5 + scaleRef * 0.05);
+          halfD = scaleRef * 0.12;
+          footSep = Math.abs(lf.x - rf.x);
+        } else {
+          const f = _ardySup.pl ? lf : rf;
+          cx = f.x; cz = f.z; halfW = halfD = scaleRef * 0.09;
+        }
+        const dzm = scaleRef * 0.004;      // 死区：4mm 级，防逐帧抖
+        let ox = 0, oz = 0;
+        if (com.x < cx - halfW - dzm) ox = com.x - (cx - halfW);
+        else if (com.x > cx + halfW + dzm) ox = com.x - (cx + halfW);
+        if (com.z < cz - halfD - dzm) oz = com.z - (cz - halfD);
+        else if (com.z > cz + halfD + dzm) oz = com.z - (cz + halfD);
+        const mag = Math.sqrt(ox * ox + oz * oz);
+        comOver = mag;
+        const cap = scaleRef * 0.12;
+        const k = (mag > cap && mag > 1e-6) ? cap / mag : 1;
+        // 只回收 60%：100% 会把骨盆顶到支撑中心，手脚一起被拽（看起来像滑步）
+        bxTarget = -ox * k * 0.6;
+        bzTarget = -oz * k * 0.6;
+      }
+    }
+    _ardySup.bx = _supSmooth(_ardySup.bx, bxTarget, dt, 0.2, scaleRef * 0.12);
+    _ardySup.bz = _supSmooth(_ardySup.bz, bzTarget, dt, 0.2, scaleRef * 0.12);
+
+    // 写入。按 w 缩放：收尾淡出时随权重一起收，不会在交还那一帧突然弹回。
+    // 近似为 0 时直接不写：省掉每帧一次 hips 子树的矩阵刷新（ardyAimApply 每帧都会重写 hips.position）。
+    if (Math.abs(_ardySup.bx) > 1e-5 || Math.abs(_ardySup.bz) > 1e-5 || _ardySup.drop > 1e-5) {
+      ardyHipsOffsetApply(_ardySup.bx * wp, -_ardySup.drop * wp, _ardySup.bz * wp);
+    }
+
+    const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (nowMs - _ardySup.logT > 2500) {
+      _ardySup.logT = nowMs;
+      const applied = Math.sqrt(_ardySup.bx * _ardySup.bx + _ardySup.bz * _ardySup.bz);
+      if (_ardySup.drop > scaleRef * 0.004 || applied > scaleRef * 0.004) {
+        postLog('info', '支撑/平衡：髋下沉 ' + (_ardySup.drop * 100).toFixed(1) + 'cm'
+          + '｜水平回收 ' + (applied * 100).toFixed(1) + 'cm'
+          + '｜COM 超出支撑 ' + (comOver * 100).toFixed(1) + 'cm｜脚距 ' + (footSep * 100).toFixed(1) + 'cm'
+          + '｜落地 ' + (_ardySup.pl ? 'L' : '-') + (_ardySup.pr ? 'R' : '-')
+          + '｜IK 残差 ' + (_ardySup.err * 100).toFixed(1) + 'cm');
+      } else if (comOver > 0) {
+        postLog('info', '支撑诊断：COM 在支撑面内（超出 ' + (comOver * 100).toFixed(1) + 'cm）'
+          + '｜脚距 ' + (footSep * 100).toFixed(1) + 'cm｜落地 ' + (_ardySup.pl ? 'L' : '-') + (_ardySup.pr ? 'R' : '-'));
+      }
+    }
+  } catch (e) { /* 约束失败不影响播放 */ }
+}
+/** 脚 IK 之后：只记录落地状态/残差（不改骨骼） */
+function ardySupportProbe(ik) {
+  try {
+    if (!ik) return;
+    _ardySup.pl = !!(ik.rl && ik.rl.planted);
+    _ardySup.pr = !!(ik.rr && ik.rr.planted);
+    const e = Math.max((ik.rl && +ik.rl.err) || 0, (ik.rr && +ik.rr.err) || 0);
+    _ardySup.err = e;
+    const scaleRef = Math.max(1e-4, (window.EmbodiedRig && window.EmbodiedRig.hipToHead) || 0.5);
+    const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (e > scaleRef * 0.02 && nowMs - _ardySup.errLogT > 3000) {
+      _ardySup.errLogT = nowMs;
+      postLog('warn', '支撑残差：脚 IK 仍差 ' + (e * 100).toFixed(1) + 'cm'
+        + '（腿长/锚点约束已尽力；先看「支撑/平衡」行有没有在动）');
+    }
+  } catch (e) { }
+}
+// 控制台：`petSupportInfo()` 一眼看约束当前状态（不用翻日志）
+window.petSupportInfo = function () {
+  return {
+    dropCm: +(_ardySup.drop * 100).toFixed(2),
+    shiftCm: +(Math.sqrt(_ardySup.bx * _ardySup.bx + _ardySup.bz * _ardySup.bz) * 100).toFixed(2),
+    planted: { left: _ardySup.pl, right: _ardySup.pr },
+    ikErrCm: +(_ardySup.err * 100).toFixed(2),
+    footIK: ardyFootIK, kneeOut: ardyKneeOut, jointLimit: ardyJointLimit,
+    supportConstraint: ardySupportOn
+  };
+};
+
 function applyArdyRetarget(dt) {
-  if (!vrm || !vrm.humanoid) { ardyActive = false; return; }
+  if (!vrm || !vrm.humanoid) { ardyActive = false; embodiedStaticSuspended = false; return; }
+  // ★ P1B：动作所有权不是生成层 ⇒ 一帧都不写（点播/bodyact/静态保持期间彻底静默）。
+  if (motionActionOwner && motionActionOwner !== 'ardy') return;
   // ★ 硬保证：本帧具身层已经写过骨骼（摆姿/预置/AI 的 bodyact spec）⇒ 生成层让位。
   //   队列清理是"君子协定"，这里才是防两层同帧互相覆盖的兜底（写入层互相覆盖 = 抽搐）。
   if (embodiedWroteFrame) return;
@@ -6242,19 +6911,33 @@ function applyArdyRetarget(dt) {
   if (ardyFrames.length) {
     ardyBlend = Math.min(1, ardyBlend + dt / 0.25);   // 入场 0.25s 淡入
     const dirs = ardyPull(dt);
-    if (dirs) { ardyLast = dirs; ardyAimApply(dirs, ardyBlend, dt); ardyFootIKApply(dt, ardyBlend); return; }
+    if (dirs) {
+      ardyLast = dirs;
+      ardyAimApply(dirs, ardyBlend, dt);
+      ardyJointLimits(ardyBlend);
+      ardyHipsConstraint(dt, ardyBlend);
+      const ik = ardyFootIKApply(dt, ardyBlend);
+      ardySupportProbe(ik);
+      return;
+    }
   }
   if (ardyLast && ardyBlend > 0) {             // 队列空 → 用最后一帧淡出，交还骨骼
     ardyBlend = Math.max(0, ardyBlend - dt / ardyFadeOut);   // 收尾别像"闪一下"（可调）
     ardyAimApply(ardyLast, ardyBlend, dt);
-    ardyFootIKApply(dt, ardyBlend);            // ★ 脚部 IK（权重 0 = 完全不动，见 ardyFootIKApply）
+    ardyHipsConstraint(dt, ardyBlend);          // 支撑/平衡随淡出权重一起收
+    const ikF = ardyFootIKApply(dt, ardyBlend); // ★ 脚部 IK（权重 0 = 完全不动，见 ardyFootIKApply）
+    ardySupportProbe(ikF);
     if (ardyBlend <= 0.001) {
       ardyLast = null; ardyActive = false; embodiedYieldOff();
+      embodiedStaticSuspended = false;   // ★ 静态保持的根位移/转身恢复
+      if (motionActionOwner === 'ardy') setMotionActionOwner(motionOwnerAfterClip(), '生成动作播完');
       postLog('info', '生成动作播完（队列走完 + 收尾淡出结束 ⇒ 正常交还骨骼）');
     }
     return;
   }
   ardyLast = null; ardyActive = false; embodiedYieldOff();
+  embodiedStaticSuspended = false;
+  if (motionActionOwner === 'ardy') setMotionActionOwner(motionOwnerAfterClip(), '生成动作播完');
   postLog('info', '生成动作播完（无尾帧可淡出 ⇒ 直接交还骨骼）');
 }
 
@@ -6267,11 +6950,15 @@ function embodiedIngest(msg) {
   if (!msg) return;
   if (msg.fps) embodiedFps = Math.max(1, Math.min(120, +msg.fps || 20));
   embodiedRootY = (typeof msg.rootY === 'number' && isFinite(msg.rootY)) ? msg.rootY : 0;   // 根位移（下蹲）
-  embodiedTurn = (typeof msg.turn === 'number' && isFinite(msg.turn)) ? Math.max(-180, Math.min(180, msg.turn)) : 0;   // 整体转身（°）
+  embodiedTurn = (typeof msg.turn === 'number' && isFinite(msg.turn)) ? Math.max(-720, Math.min(720, msg.turn)) : 0;   // 整体转身（°；±720，360=转一圈）
   const fr = Array.isArray(msg) ? msg : (msg.frames || []);
   // ★ v11.12 连招（chain）：上一段若是"末尾不回中性"且正保持着末帧等接续，就把它的末帧记下来 ——
   //   本段开头会从那个姿势滑过去（见 embodiedPull 的"接续混合"），于是两段之间不会"站定一下再动"。
-  const wasHolding = embodiedClipChain && embodiedChainHoldT > 0;
+  // ★ 11.66 并行兜底：新的 AI bodyact 在上一段还在播/链式保持时到达 ⇒ 从当前姿势直接接上，
+  //   清掉旧队列并滑过去（0.15s），不再等旧动作播完/回站姿。
+  const _overlap = !!(msg.overlap && msg.overlapFrom && msg.overlapFrom.joints);
+  if (_overlap) { embodiedQueue = []; embodiedPlayT = 0; embodiedChainFrom = msg.overlapFrom; embodiedChainFromT = 0; }
+  const wasHolding = !_overlap && embodiedClipChain && embodiedChainHoldT > 0;
   const prevLast = wasHolding ? (embodiedQueue[embodiedQueue.length - 1] || embodiedQueue[0]) : null;
   let n = 0;
   if (Array.isArray(fr)) for (const f of fr) if (f && f.joints) { embodiedQueue.push(f); n++; }
@@ -6288,12 +6975,14 @@ function embodiedIngest(msg) {
     postLog('info', '具身队列超限：已裁掉尾部 ' + _cutN + ' 帧（正在播的不动）⇒ 当前 ' + embodiedQueue.length + ' 帧');
   }
   embodiedLiveReset();
-  postLog('info', '★ 动作入队 · 前端版本 v11.50 ｜ 本次 ' + n + ' 帧');                  // ★ v11.29 新动作开始：清空"放下实况"缓冲
-  embodiedClipChain = !!msg.chain;
+  postLog('info', '★ 动作入队 · 前端版本 v11.66 ｜ 本次 ' + n + ' 帧');                  // ★ v11.29 新动作开始：清空"放下实况"缓冲
+  embodiedClipChain = !!msg.chain || _overlap;
+  embodiedStaticHold = !!msg.static;   // ★ P0-A1：静态保持标记（1 帧重复写，不推进）
+  if (embodiedStaticHold) embodiedStaticHoldAt = performance.now();   // 续期（面板每 2s 发一次）
   embodiedChainHoldT = 0;
   embodiedTauOverride = (typeof msg.tau === 'number' && msg.tau > 0) ? Math.max(0.005, Math.min(0.5, msg.tau)) : 0;
   if (wasHolding && prevLast && prevLast.joints && n > 0) { embodiedChainFrom = prevLast; embodiedChainFromT = 0; }
-  postLog('info', '具身帧已入队：本次 ' + n + ' 帧，队列共 ' + embodiedQueue.length + ' 帧'
+  postLog('info', '具身帧已入队：本次 ' + n + ' 帧' + (_overlap ? '（并行接续）' : '') + '，队列共 ' + embodiedQueue.length + ' 帧'
     + (embodiedClipChain ? '｜链式（末尾不回中性）' : '') + (embodiedChainFrom ? '｜接上一段末帧' : ''));
 }
 // 「动胯」时把**髋窝钉住**：骨盆一转，两个髋关节的世界坐标就会绕着骨盆中心被甩出去，
@@ -6547,6 +7236,7 @@ function applyEmbodiedLegPinRaw() {
 let embodiedRootY = 0, embodiedRootApplied = 0;
 // ★ v11.12 连招（chain）：本段是否"末尾不回中性"、播完后保持末帧等接续的计时、以及"上一段的末帧"（供接续混合）
 let embodiedClipChain = false, embodiedChainHoldT = 0, embodiedChainFrom = null, embodiedChainFromT = 0;
+let embodiedCurrentJoints = null;   // 当前正在写的姿势：并行动作接续的起点（不经过“回站姿”）
 // ★ v11.13 每个动作可以自带"输出平滑"覆盖（`spec.tau`）：跳跃这类**爆发型**动作默认 τ=0.05s 会把
 //   "蹬地那一下"抹圆（看着像弹簧/气球），给预置写 τ=0.02~0.03 才保得住爆发力。0 = 用面板值。
 let embodiedTauOverride = 0;
@@ -6555,7 +7245,8 @@ function applyEmbodiedRoot() {
   const hips = vrm.humanoid.getNormalizedBoneNode('hips');
   const base = embodiedRestP['hips'];
   if (!hips || !base) return;
-  const want = embodiedYielding ? embodiedRootY : 0;
+  const _ownerBlocksRoot = (motionActionOwner === 'clip' || motionActionOwner === 'ardy');
+  const want = (embodiedYielding && !embodiedStaticSuspended && !_ownerBlocksRoot) ? embodiedRootY : 0;
   if (Math.abs(want - embodiedRootApplied) < 1e-6) return;
   // 只动 y：模型根一般不旋转；以后要支持前后/左右位移，按父级世界旋转换算即可。
   hips.position.set(base.x, base.y + want, base.z);
@@ -6568,14 +7259,34 @@ function applyEmbodiedRoot() {
 // 要转 90° 以上必须转整体，否则就是把胯相对腿拧死 = 反关节。
 let embodiedTurn = 0, embodiedTurnCur = 0;
 function applyEmbodiedTurn(dt) {
-  const want = embodiedYielding ? (embodiedTurn * Math.PI / 180) : 0;    // 让位后自己转回正向
+  const _ownerBlocksTurn = (motionActionOwner === 'clip' || motionActionOwner === 'ardy');
+  const yielding = !!(embodiedYielding && !embodiedStaticSuspended && !_ownerBlocksTurn);
+  const want = yielding ? (embodiedTurn * Math.PI / 180) : 0;    // 让位后转回正向
+  if (!yielding) {
+    // ★ 动作结束：先把当前角度折算到 (-180°,180°] 的**同一朝向等效角** —— 旋转 360° 时
+    //   等价于 0°（不会"转一圈再倒转回来"）；270° 等价于 -90°（只沿最短路径回 90°）。
+    //   这一步不改变画面朝向，所以不会跳。
+    if (Math.abs(embodiedTurnCur) > Math.PI) {
+      embodiedTurnCur = Math.atan2(Math.sin(embodiedTurnCur), Math.cos(embodiedTurnCur));
+    }
+    if (Math.abs(embodiedTurnCur) < 0.02) { embodiedTurnCur = 0; return 0; }
+  }
   if (Math.abs(want - embodiedTurnCur) < 1e-5) return embodiedTurnCur;
-  const k = (dt > 0) ? (1 - Math.exp(-dt * 3.5)) : 1;                    // 转得慢一点才有分量
+  // 转过去稍快、转回来慢（旧版两边都是 τ0.29s ⇒ 收尾像"甩"一下）
+  const rate = yielding ? 2.2 : 1.1;
+  const k = (dt > 0) ? (1 - Math.exp(-dt * rate)) : 1;
   embodiedTurnCur += (want - embodiedTurnCur) * k;
   return embodiedTurnCur;
 }
 
 // 转身之后**必须衰减头/脊椎跟随**：身体转过去、头却还想盯着镜头 ⇒ 脖子拧 180°（鬼片）。
+// 具身/生成层自己写了头/颈/脊椎时，暂停“鼠标视线”覆盖 —— 否则 lookAt 在 vrm.update 里
+// 会把动作写的头转回来（点头/歪头看不见，只剩身体在动 = “僵硬”）。静态保持不算，避免长姿势时像人棍。
+function actionHeadOwned() {
+  try { return !!(ardyActive || (embodiedYielding && embodiedQueue && embodiedQueue.length > 0 && !embodiedQueueIsHold)); }
+  catch (e) { return false; }
+}
+
 function bodyTurnFade() {
   const deg = Math.abs(embodiedTurnCur) * 180 / Math.PI;
   return Math.max(0, 1 - deg / 75);
@@ -6595,6 +7306,15 @@ function embodiedInterp(a, b, f) {
 }
 function embodiedPull(dt) {
   if (!embodiedQueue.length) return null;
+  // ★ P0-A1：静态保持只留 1 帧，每帧重复写 —— 不推进播放头、不补尾、不交还。
+  //   它仍然 `embodiedQueueIsHold=true`，所以任何真动作/生成动作都能让它自动让位；
+  //   动作结束后再自动接回（见 applyEmbodiedRetarget 的让位分支）。
+  if (embodiedStaticHold) {
+    const f = embodiedQueue[0];
+    embodiedPlayT = 0;
+    embodiedCurrentJoints = (f && f.joints) || {};
+    return { joints: embodiedCurrentJoints, rootY: (f && typeof f.rootY === 'number') ? f.rootY : null };
+  }
   embodiedPlayT += dt * embodiedFps;                 // 播放头按“源帧率”推进
   while (embodiedPlayT >= 1 && embodiedQueue.length > 1) { embodiedQueue.shift(); embodiedPlayT -= 1; }
   // ★ v11.12 连招保持：标了 `chain` 的段播完**不立刻交还** —— 把末帧姿势保持最多 1.2 秒，
@@ -6608,8 +7328,10 @@ function embodiedPull(dt) {
   }
   if (embodiedPlayT >= 1) {
     embodiedQueue = []; embodiedPlayT = 0; embodiedRootY = 0;
+    embodiedQueueIsHold = false; embodiedStaticHold = false;
     embodiedClipChain = false; embodiedChainHoldT = 0; embodiedChainFrom = null;
     embodiedTauOverride = 0;                            // 平滑覆盖随动作一起复位
+    if (motionActionOwner === 'embodied') setMotionActionOwner(motionOwnerAfterClip(), 'bodyact 播完');
     embodiedLiveDump('左上臂'); postLog('info', '具身动作播放完毕'); return null;   // 播完 → 交回控制权（★ v11.10：帧级根位移也要归零）
   }
   embodiedChainHoldT = 0;                              // 还在播 ⇒ 保持计时清零（只从"播完"开始算）
@@ -6630,6 +7352,7 @@ function embodiedPull(dt) {
     if (w > 0) jt = embodiedInterp(embodiedChainFrom, { joints: jt }, 1 - w);
     else embodiedChainFrom = null;
   }
+  embodiedCurrentJoints = jt;
   return { joints: jt, rootY: ry };
 }
 let _embTargetQ = null, _embP = null, _embInvP = null, _embD = null;
@@ -6966,7 +7689,8 @@ function embodiedApplyJoints(joints, dt) {
     else cur.copy(tq);
     // ★★ v11.32 治"头/脊椎追踪被搞废"：保持类剪辑（40 秒+每2秒续持）长期接管骨骼 ⇒ 绝对覆盖掉追踪层的
     //   颈/胸/脊偏移。修法：保持类剪辑**不写**追踪领地的躯干骨（颈/胸/上胸/脊/胯），其余照写。
-    const _holdNoTorso = (typeof embodiedQueueIsHold !== 'undefined' && embodiedQueueIsHold) && /^(neck|chest|upperChest|spine|hips)$/.test(key);
+    // ★ P0-A1：静态保持（存档造型）要**完整**还原（含颈/胸/脊/胯）；只有“临时保持预览”才给追踪让躯干。
+    const _holdNoTorso = !embodiedStaticHold && (typeof embodiedQueueIsHold !== 'undefined' && embodiedQueueIsHold) && /^(neck|chest|upperChest|spine|hips)$/.test(key);
     if (!_holdNoTorso) b.quaternion.copy(cur);
   }
   // ★ 手指落地诊断（只读）：1s 限流 + 只在角度变化时打 ⇒ 不刷屏；有这行就不必再靠肉眼判断"动没动"。
@@ -7012,6 +7736,9 @@ function embodiedDemoFrame(t) {
 function applyEmbodiedRetarget(dt) {
   if (!embodiedOn()) { embodiedYieldOff(); return; }        // 关（默认）：no-op，不打断任何东西
   if (!vrm || !vrm.humanoid) return;                        // 仅 VRM（PMX 见 skill §7）
+  // ★ P1B：动作所有权不是具身层（点播/生成）⇒ 一帧都不写。静态保持也走这里被挂起，
+  //   不再依赖 `embodiedQueueIsHold && currentMotionAction` 的时序判断（日志已实证会漏）。
+  if (motionActionOwner === 'clip' || motionActionOwner === 'ardy') return;
   // ★★ v11.36c「让位规则」—— 用户："怎么还能给波及到舞蹈？动作舞蹈完全不对了"。
   //   证据（日志）：`★ 骨骼层冲突：具身动作+跳舞 本帧同时写骨骼` + 同一行 `跳舞=true 具身接管=true
   //   保持剪辑=true 队列=213帧`。凶手是造型面板的**40 秒「保持预览」剪辑**：它每帧把姿势写回
@@ -7110,6 +7837,15 @@ function embodiedComposeAndPlay(spec, opts) {
       const rep = V.check(spec, { channels: (C.channelNames ? C.channelNames() : null), autoFix: true });
       for (const it of (rep.issues || [])) postLog('warn', '动作校验：' + it.msg);
       if (rep.level >= 2) {
+        // ★ 失败时把 AI 原文摊开（截断 400 字）：否则日志只说"所有通道都无效"，根本不知道它写了什么。
+        try {
+          const raw0 = JSON.stringify(spec);
+          const topKeys = Object.keys(spec || {}).join(',');
+          const step0 = (spec && spec.steps && spec.steps[0] && spec.steps[0].pose)
+            ? Object.keys(spec.steps[0].pose).join(',') : '(无)';
+          postLog('warn', '动作校验详情：顶层[' + topKeys + ']｜首段通道[' + step0 + ']｜原文 '
+            + (raw0.length > 400 ? raw0.slice(0, 400) + '…' : raw0));
+        } catch (eV) { }
         postLog('warn', '动作校验未通过 ⇒ **退回预置动作 ' + rep.fallbackPreset + '**（AI 写的这份不播）');
         spec = { preset: rep.fallbackPreset };
       } else if (rep.level === 1 && rep.fixed) {
@@ -7117,6 +7853,31 @@ function embodiedComposeAndPlay(spec, opts) {
         spec = rep.fixed;
       }
     } else postLog('warn', '校验器未加载（embodied-validate.js 没进来）—— 本次 AI 动作不做校验');
+  }
+  // ★ P0-A1（前置折叠）：静态保持不需要把 40s 时间线真的展开成 803 帧再截 ——
+  //   这里先把 steps 折叠成**最终姿势**，用 `start=最终姿势 + 一步 0.06s` 合成（通常只有 1~2 帧）。
+  //   否则拖动滑条时每次 `sendPose` 都要合成 800+ 帧，白白烧 CPU。
+  if (opts && opts.static && Array.isArray(spec.steps) && spec.steps.length) {
+    const merged = {};
+    if (spec.start && typeof spec.start === 'object') Object.assign(merged, spec.start);
+    let rootY = spec.rootY, crouch = spec.crouch, kneel = spec.kneel, turn = spec.turn;
+    let fingers = spec.fingers;
+    for (const st of spec.steps) {
+      if (!st) continue;
+      if (st.pose && typeof st.pose === 'object') Object.assign(merged, st.pose);
+      if (st.fingers && typeof st.fingers === 'object') fingers = Object.assign({}, fingers || {}, st.fingers);
+      if (st.rootY !== undefined) rootY = st.rootY;
+      if (st.crouch !== undefined) crouch = st.crouch;
+      if (st.kneel !== undefined) kneel = st.kneel;
+      if (st.turn !== undefined) turn = st.turn;
+    }
+    spec = Object.assign({}, spec, {
+      chain: true, repeat: 1, start: merged,
+      steps: [{ pose: merged, dur: 0.06, ease: 'linear' }],
+      fingers: fingers,
+      rootY: rootY, crouch: crouch, kneel: kneel, turn: turn,
+    });
+    postLog('info', '静态保持：spec 已折叠为 1 步（不再展开 40s 时间线）');
   }
   // 自愈：腿部尺寸 / 手指局部轴没量到（模型加载时序/量测异常）时，趁这次合成再量一次 —— 蹲跪与手型都依赖它。
   try {
@@ -7140,6 +7901,32 @@ function embodiedComposeAndPlay(spec, opts) {
     clip = C.compose(spec, window.EmbodiedRig);
   }
   if (!clip || !clip.frames.length) { postLog('info', 'BodyAct 合成结果为空（steps 为空？）'); return false; }
+  // ★★ P0-A1：静态保持（造型存档 / 面板预览 / 蹲下·跪下）—— 只留**1 帧**，每帧重复写。
+  //   旧行为是排出 803 帧（40.1s）的保持剪辑：载入即冻结 40s、队列 782→682→…、任何动作都要先清队，
+  //   日志实证见附录 E。静态保持仍然 `embodiedQueueIsHold=true`，所以任何真动作都能覆盖它；
+  //   动作结束后它再自动接回（不用重新摆姿势）。
+  const staticHold = !!(opts && opts.static);
+  if (staticHold) {
+    const idx = Math.min(clip.frames.length - 1, Math.max(0, Math.round((clip.fps || 20) * 0.6)));
+    const f = clip.frames[idx] || clip.frames[clip.frames.length - 1];
+    const before = clip.frames.length;
+    clip = Object.assign({}, clip, {
+      frames: [{ joints: (f && f.joints) || {}, rootY: (f && typeof f.rootY === 'number') ? f.rootY : null }],
+      static: true,
+    });
+    postLog('info', '静态保持：' + before + ' 帧 → 1 帧｜额定 20fps（不再排 40s 队列）');
+  }
+  // ★★ P0-A2：AI 动作总时长上限。日志实证：AI 会写 `#2 40.00s·通道48` ⇒ 803 帧动作把宠物按住 40s。
+  //   这里只截 **AI 路径**（opts.ai）；造型面板的静态保持走上面 1 帧，不受影响。
+  const BODYACT_MAX_SECONDS = 8;
+  if (opts && opts.ai && !staticHold) {
+    const maxFrames = Math.max(1, Math.round((clip.fps || 20) * BODYACT_MAX_SECONDS));
+    if (clip.frames.length > maxFrames) {
+      postLog('info', 'AI 动作过长：' + clip.frames.length + ' 帧（' + (clip.frames.length / (clip.fps || 20)).toFixed(1)
+        + 's）⇒ 截到 ' + maxFrames + ' 帧（' + BODYACT_MAX_SECONDS + 's）；保持姿势请改用静态造型/面板');
+      clip = Object.assign({}, clip, { frames: clip.frames.slice(0, maxFrames) });
+    }
+  }
   // ★★ 用户点「试做」/ AI 下发动作时**不该排在一段"保持预览"后面**：造型面板的保持剪辑长达 40 秒
   //   （`sendPose(..., true)` 发的是 `dur:40`），而这里走的是**追加**语义 ⇒ 新动作几十秒后才动 ——
   //   实测症状就是"点了没做"（其实合成、入队都成功了，只是排在长剪辑后面）。
@@ -7163,11 +7950,36 @@ function embodiedComposeAndPlay(spec, opts) {
     postLog('info', '造型预览已丢弃：有动作在播（舞蹈/生成动作）⇒ 静态姿势不入队，避免把动作掐断');
     return false;
   }
-  embodiedQueueIsHold = holdNow;
+  embodiedQueueIsHold = holdNow || staticHold;
+  embodiedStaticHold = staticHold;
+  embodiedStaticSuspended = staticHold && (typeof ardyActive !== 'undefined' && ardyActive);
+  // ★ P1B 单一动作所有者：非静态的真动作开始 ⇒ 停掉生成动作（最新请求赢）。
+  //   旧行为只靠 `embodiedWroteFrame` 让 ardy 整帧让位，但 ardy 仍 active，动作结束后会“接着播”；
+  //   现在直接 stop，避免两个动作各播一半。
+  if (!staticHold && typeof ardyActive !== 'undefined' && ardyActive && typeof window.ardyStopArdy === 'function') {
+    window.ardyStopArdy('具身动作接管');
+  }
   // ★ v11.13：把预置/ spec 自带的"输出平滑"（tau）带给播放层 —— 跳跃这类**爆发型**动作要用更小的 τ
   //   （面板默认 0.05s 会把"蹬地那一下"抹圆，看着像弹簧）。
   if (typeof effSpec.tau === 'number') clip.tau = effSpec.tau;
+  // ★ 11.66 并行兜底：上一段 bodyact 还在播（或链式保持 1.2s 内）时，新的 AI 动作不再排队等它回站姿，
+  //   而是从“当前姿势”直接接上（0.15s 滑入），实现真正的连续/重叠手势。
+  const _canOverlap = !staticHold && embodiedYielding && !embodiedStaticHold
+    && motionActionOwner === 'embodied' && !!embodiedCurrentJoints
+    && (embodiedQueue.length > 0 || (embodiedClipChain && embodiedChainHoldT > 0))
+    && !(typeof ardyActive !== 'undefined' && ardyActive);
+  if (_canOverlap) {
+    clip.overlap = true;
+    clip.overlapFrom = { joints: embodiedCurrentJoints };
+    postLog('info', '并行动作：从当前姿势接续（前一段不再回站/不再等播放完）');
+  }
   embodiedIngest(clip);
+  // 静态保持遇到正在播的真动作时**不抢所有权**：先入队，等动作结束由 motionOwnerAfterClip() 接回。
+  const _ownerBusyNow = (typeof currentMotionAction !== 'undefined' && !!currentMotionAction)
+    || (typeof dancingNow !== 'undefined' && !!dancingNow)
+    || (typeof ardyActive !== 'undefined' && !!ardyActive);
+  setMotionActionOwner(staticHold ? (_ownerBusyNow ? motionActionOwner : 'hold') : 'embodied',
+    staticHold ? '静态保持' : 'bodyact');
   postLog('info', 'BodyAct 已合成：' + clip.frames.length + ' 帧 @' + clip.fps + 'fps' +
     (spec.preset ? '（预设 ' + spec.preset + '）' : '（steps ' + ((spec.steps || []).length) + '）'));
   // ★ v11.9：把 spec 的**结构**也打出来（几步、每步多长、几个通道、有没有手型/根位移、段间平滑值）。
@@ -7187,6 +7999,18 @@ function embodiedComposeAndPlay(spec, opts) {
         : '';
       return '#' + (i + 1) + ' ' + dur + '·通道' + chans + (fins ? '·' + fins : '') + (rt ? '·' + rt : '');
     }).join('｜');
+    // ★ 通道明细（只记前 8 个/步）：以后“动作僵硬/姿势不对”不用靠肉眼猜是哪几个通道在动
+    try {
+      const _all = st.map((s, i) => {
+        const p0 = (s && s.pose) || {};
+        const ks = Object.keys(p0).filter(k => Math.abs(+p0[k] || 0) > 0.5);
+        if (!ks.length) return '';
+        const txt = ks.slice(0, 10).map(k => k + (+p0[k] || 0).toFixed(0)).join(',');
+        return '#' + (i + 1) + '[' + txt + (ks.length > 10 ? '…' : '') + ']';
+      }).filter(Boolean);
+      const _detail = _all.slice(0, 8).join('｜') + (_all.length > 8 ? '…' : '');
+      if (_detail) postLog('info', 'BodyAct 通道：' + _detail);
+    } catch (e) { }
     postLog('info', 'BodyAct 摘要：' + (spec.preset ? ('预设「' + spec.preset + '」') : (st.length + ' 步'))
       + '｜总时长 ' + (clip.frames.length / Math.max(1, clip.fps)).toFixed(1) + 's'
       + (parts ? ('｜' + parts) : '')
@@ -7315,7 +8139,9 @@ window.embodiedPoseOnce = function (spec, opt) {
   //   否则 ardy 的生成动作会继续每帧写腿/臂，把刚摆好的姿势覆盖掉（膝不弯、手乱摆、抽搐）。
   //   ★ 但"自动续持/存档恢复"不算"明确请求" ⇒ 跳过这条（否则等于定时炸弹，每 40s 掐一次动作）。
   if (!autoKeep && typeof window.ardyStopArdy === 'function' && ardyActive) window.ardyStopArdy('造型面板主动改造型');
-  return embodiedComposeAndPlay(spec);
+  // ★ P0-A1：造型面板/存档恢复走**静态保持**（1 帧），不再发 803 帧的 40s 保持剪辑。
+  //   面板拖动/蹲下/跪下/自动恢复都走这里；真动作仍由 embodied_compose 走非静态路径。
+  return embodiedComposeAndPlay(spec, { static: true });
 };
 
 // ---- 动作播放（带过渡 crossfade + 默认时长）与自动跳舞 ----
@@ -7354,6 +8180,7 @@ function stopCurrentMotion(fade) {
   currentMotionAction = null;
   currentMotionName = null; updateNowPlaying();
   setClipActive(nm, false);   // 解除活跃标记，允许其被缓存淘汰
+  if (motionActionOwner === 'clip') setMotionActionOwner(motionOwnerAfterClip(), '点播结束');
 }
 async function playVRMMotion(name, seconds, fadeOverride, oneShot) {
   if (!vrm || !vrmMixer) return false;
@@ -7372,13 +8199,31 @@ async function playVRMMotion(name, seconds, fadeOverride, oneShot) {
   if (currentMotionAction && currentMotionAction !== action) { try { currentMotionAction.fadeOut(fade); } catch (e) { } }
   currentMotionAction = action;
   dancingNow = true;   // 标记“正在播动作”，供“舞蹈时关闭追踪”判定
+  // ★ P1B 单一动作所有者：点播动作开始 ⇒ 停生成动作 + 清非静态的具身动作队列（最新请求赢）。
+  //   静态保持不动（交给渲染循环挂起/接回），避免用户存好的造型被一次点播永久丢掉。
+  if (typeof ardyActive !== 'undefined' && ardyActive && typeof window.ardyStopArdy === 'function') {
+    window.ardyStopArdy('点播动作接管');
+  }
+  if (embodiedQueue.length && !embodiedStaticHold) {
+    postLog('info', '· 点播动作：具身动作队列（' + embodiedQueue.length + ' 帧）已清空，让位');
+    embodiedQueue = []; embodiedPlayT = 0; embodiedT = 0; embodiedQueueIsHold = false;
+  }
   // ★ v11.36c：点播舞蹈时，造型面板的 40s「保持预览」若还占着骨骼，直接清掉 ——
   //   留着它的话，它会在舞蹈播到一半时继续逐帧盖骨（用户："舞蹈完全不对了"）。
   //   造型面板下次摆姿势/开面板会重新发一条，所以丢掉不会让姿势永久丢失。
   if (embodiedQueueIsHold && embodiedQueue.length) {
-    postLog('info', '· 点播动作：造型面板的"保持预览"（' + embodiedQueue.length + ' 帧）已清空，让位给舞蹈');
-    embodiedQueue = []; embodiedPlayT = 0; embodiedT = 0; embodiedQueueIsHold = false;
+    if (embodiedStaticHold) {
+      // ★ P0-A1：静态保持不消费 —— 渲染循环的让位分支已经让它停止写骨；动作结束后自动接回。
+      postLog('info', '· 点播动作：静态保持已挂起（动作结束后自动接回）');
+    } else {
+      postLog('info', '· 点播动作：造型面板的"保持预览"（' + embodiedQueue.length + ' 帧）已清空，让位给舞蹈');
+      embodiedQueue = []; embodiedPlayT = 0; embodiedT = 0; embodiedQueueIsHold = false;
+    }
   }
+  // ★ P1B：点播动作独占骨骼。静态保持保留（owner 变 clip 后由渲染循环挂起），
+  //   但具身/生成层立即停写；`embodiedYieldOff` 把根位移/转身交还 mixer。
+  try { embodiedYieldOff(); } catch (e) { }
+  setMotionActionOwner('clip', '点播动作');
   currentMotionName = name; updateNowPlaying();   // 记录正在播放的动作，供 UI 显示
   applyMotionExpression(clip);   // 不带表情轨道的动作 → 自动叠一个表情
   // 时长：① 显式 seconds 优先；② oneShot（AI 调 <Motion> 不带 seconds，语义="自然播放一次"）
@@ -7600,6 +8445,8 @@ messageBus.on('bodyexpress', (msg) => { if (msg) embodiedExpress(msg); });      
 // 这样 AI 只会看到"确实播了"或"确实回退了"，不会出现"嘴上说做了、画面没动"。
 messageBus.on('bodyact_prompt', async (msg) => {
   const prompt = (msg && msg.prompt) || '';
+  const _sec = +(msg && msg.seconds) || 0;
+  const _frames = (_sec > 0) ? Math.round(_sec * 20) : undefined;   // 4A：gen: 的 seconds 变成生成长度（20fps）
   if (!prompt) return;
   if (!window.ardyPlay) { postLog('error', '生成式动作不可用：ardy-client.js 未加载'); return; }
   postLog('info', 'AI 请求生成式动作：' + prompt);
@@ -7608,12 +8455,12 @@ messageBus.on('bodyact_prompt', async (msg) => {
   let okGen = null, approx = false, judged = false;
   try {
     if (window.ardyPlayVerified) {
-      const r = await window.ardyPlayVerified(prompt);
+      const r = await window.ardyPlayVerified(prompt, { frames: _frames });
       okGen = !!(r && r.ok);
       approx = !!(r && (r.approx || (r.pass === null)));
       judged = !!(r && r.pass !== null);
     } else {
-      okGen = await window.ardyPlay(prompt);      // 旧路径兜底
+      okGen = await window.ardyPlay(prompt, { frames: _frames });      // 旧路径兜底
     }
   } catch (e) { okGen = null; }
   if (okGen) {
@@ -9463,14 +10310,17 @@ function buildSettingsUI() {
     });
     r.appendChild(b); sec.appendChild(r); sec.appendChild(info);
 
-    // 第 2 步：写一句英文动作提示 → ardy 生成 40 帧(约 2 秒) → 重定向到当前 VRM → 真的摆出来
-    const b2 = el('button', 'sp-toggle', '▶ 第2步自检(生成→重定向→播放)');
+    // 第 2 步：写一句英文动作提示 → ardy 生成 80 帧(4 秒) → 重定向到当前 VRM → 真的摆出来
+    // ★ 4A：带 cache ⇒ 第二次点同一个按钮会直接命中动作银行（日志 `命中动作银行`），不再等生成。
+    const b2 = el('button', 'sp-toggle', '▶ 第2步自检(生成→重定向→播放｜第二次走银行)');
     const info2 = el('div', '', '');
     info2.style.fontSize = '12px'; info2.style.opacity = '0.75';
-    info2.textContent = '生成约 6 秒/段；播完自动把骨骼还给待机/跳舞';
+    info2.textContent = '生成 80 帧/4 秒；第一次生成并存入银行，第二次同词条应瞬发（看日志"命中动作银行"）';
     b2.addEventListener('click', async () => {
-      b2.textContent = '生成中…（约 6 秒，首次更慢，别关窗口）';
-      const ok2 = window.ardyPlay ? await window.ardyPlay('a person raises the right hand high above the head and waves hello') : null;
+      b2.textContent = '生成中…（首次较慢，别关窗口）';
+      const ok2 = window.ardyPlay
+        ? await window.ardyPlay('a person raises the right hand high above the head and waves hello', { cache: true })
+        : null;
       b2.textContent = ok2 ? '✅ 已重定向并播放（详情见日志）' : '❌ 失败（详情见日志）';
     });
     r.appendChild(b2); sec.appendChild(r); sec.appendChild(info2);
@@ -9841,27 +10691,15 @@ function buildSettingsUI() {
       // ★ 记住"这次发出去的数值"（按模型；空草稿不覆盖、清空走 force，见 persistDraft 注释）
       try { persistDraft(false); } catch (e) { }
       if (!hold) { clearInterval(poseHoldTimer); poseHoldTimer = null; return; }
-      if (!poseHoldTimer) poseHoldTimer = setInterval(() => {
-        if (!sec.isConnected) { clearInterval(poseHoldTimer); poseHoldTimer = null; return; }   // 面板已关 → 停
-        // ★ 正在播"真动作"（试做/ AI 下发）时不打断它 —— 等它播完再续持，否则会把动作拦腰砍断
-        if (!embodiedQueueIsHold && embodiedQueue.length) return;
-        // ★★ 保持剪辑**尾巴自带"回到中性"**（compose 为防止收尾瞬跳会自动补一段），所以必须在它播完
-        //   **之前**就顶上，否则人物会周期性地**收回站立姿势**、等下一次定时器才摆回来 ——
-        //   用户实测症状："调完姿势，隔一段固定时间变成初始站立姿态，然后又回去"。
-        //   现在：剩余 <100 帧（5s）就续；且定时器 2s 一跳 ⇒ 最多晚 2s 顶上，永远吃不到尾段。
-        //   （"重发会闪/抽"这个老毛病已由 `start` 起始姿势从根上解决，所以可以放心勤续持。）
-        if (embodiedQueueIsHold && embodiedQueue.length > 100) return;
-        sendPose(poseDraft, true, true);
-      }, 2000);
+      // ★ P0-A1：静态保持（1 帧、每帧重复写）不会自己结束 ⇒ **不再需要 2s 续持定时器**。
+      //   旧定时器是为 40s 保持剪辑“快播完时顶上”而存在的；现在它只会每 2s 重复合成/入队一次。
+      clearInterval(poseHoldTimer); poseHoldTimer = null;
     };
 
     // ★★ 拖动限流 —— 这条**必须**有。滑条每动一下（`input` 事件可到 60/s）就会走一次 sendPose：
-    //   而 hold 模式的 spec 是「0.01s 跟手 + **40 秒保持**」⇒ 一支 **809 帧**的剪辑，
-    //   而且 `embodiedPoseOnce` 是**整队替换**（还顺带停掉 ardy 层）。
-    //   实测（用户日志）：一秒内塞了 ~20 支 809 帧剪辑 —— 后果有两层：
-    //   ① 白白烧 CPU（每支要合成 800+ 帧 × 30 关节）；
-    //   ② **每次整队替换都是一次"交接"**（清队 → 重新灌帧 → 平滑状态重置），
-    //      交接那一帧很容易露出底下的基础姿势 ⇒ 肉眼就是"抽到另一个姿势一瞬间又回来"。
+    //   P0-A1 后 hold 会折叠成 1 步（通常 1~2 帧），但 `embodiedPoseOnce` 仍是**整队替换**
+    //   （还顺带停掉 ardy 层）；一秒 20 次仍会产生 20 次"清队 → 重灌 → 平滑重置"的交接，
+    //   交接那一帧容易露出基础姿势 ⇒ 肉眼就是"抽一下"。
     //   限流到 ~10 次/秒，并保证**松手后一定补发最后一次**（否则最后一格停不到位、拖完不回正）。
     let _poseSendT = 0, _poseSendTimer = null, _poseSendArgs = null;
     const sendPose = (pose, hold, refresh, noFingers) => {
@@ -10315,7 +11153,7 @@ function buildSettingsUI() {
   body.appendChild(sec);
 
   sec = spSection('姿势（骨骼微调，动作翻车可自行掰正）');
-  spDropdown(sec, '当前姿势', [{ v: 'stand', t: '站立' }, { v: 'sit', t: '坐' }, { v: 'lieback', t: '仰躺' }], currentPose || 'stand', v => { sendMenu('posture', { pose: v }); const w = sec._bonesWrap; if (w) buildPoseBones(w); });
+  spDropdown(sec, '当前姿势', [{ v: 'stand', t: '站立' }, { v: 'sit_full', t: '坐（全身）' }, { v: 'sit', t: '坐（任务栏）' }, { v: 'lieback', t: '仰躺' }], currentPose || 'stand', v => { sendMenu('posture', { pose: v }); const w = sec._bonesWrap; if (w) buildPoseBones(w); });
   // ★ 轴向自动校正（实测）：有些转换模型（PMX→VRM）的骨骼局部轴与作者写 RELAX/POSES 的约定**同轴反号**，
   //   表现就是"拖『上』却往『下』"。加载时已量出（日志 `姿势轴向` 那行），这里只控制**是否把它作用到微调值**上；
   //   RELAX / 姿势预设不受影响（避免把当前看着正常的基础姿势改坏）。觉得更糟就关掉。

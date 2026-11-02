@@ -5,15 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>3D 桌宠</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- ★ 三方库全部随插件分发（vendor/），不走 CDN：
+       ① 没网 / 国内访问 jsdelivr 不通时，桌宠不会白屏；
+       ② 版本固定，不受 CDN 上版本漂移影响。改库版本时同步改这里与 vendor/。 -->
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-      "three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.js",
-      "three-vrm-animation": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.4.0/lib/three-vrm-animation.module.js"
+      "three": "./vendor/three.module.js",
+      "three/addons/": "./vendor/addons/",
+      "three-vrm": "./vendor/three-vrm.module.js",
+      "three-vrm-animation": "./vendor/three-vrm-animation.module.js"
     }
   }
+  </script>
+  <!-- ★ MMD 物理（ammo.js）同样本地化：先取到工厂函数，pet.js 在真正用到物理时再实例化
+       （实例化要读 .wasm，file:// 下会被挡 ⇒ 由 pet.js 用 locateFile 指到 vendor/ammo/）。 -->
+  <script src="vendor/ammo/ammo.wasm.js"></script>
+  <script>
+    (function () {
+      try { window.__AmmoFactory = (typeof Ammo === 'function') ? Ammo : null; } catch (e) { window.__AmmoFactory = null; }
+      try { if (typeof Ammo === 'function') { window.Ammo = undefined; } } catch (e) { }
+    })();
   </script>
 </head>
 <body>
@@ -35,7 +47,7 @@
 <script>
  (function () {
   var t = '?t=' + Date.now();
-  var list = ['embodied-compose.js', 'embodied-validate.js', 'ardy-retarget.js', 'ardy-web/ardy-client.js', 'embodied-expression.js', 'face-engine.js'];
+  var list = ['motion/pose.js', 'motion/state.js', 'motion/runtime.js', 'embodied-compose.js', 'embodied-validate.js', 'ardy-retarget.js', 'ardy-web/ardy-client.js', 'embodied-expression.js', 'face-engine.js'];
   var i = 0;
   function next() {
    if (i >= list.length) {

@@ -35,6 +35,49 @@
     try { console.log(text); } catch (e) { }
   }
 
+  // ---- 4A 动作银行：同一词条 + 同一骨架 ⇒ 直接复用已生成/已验收的帧（跳过 1~5s 生成）----
+  //   只存 retarget 后的 frames（aims/root/contact），不存 raw 权重；按骨架基签名失效，换模型不会串用。
+  function bankSig() {
+    try {
+      var rig = (typeof window.embodiedRigEnsure === 'function') ? window.embodiedRigEnsure() : window.EmbodiedRig;
+      if (!rig || !window.ArdyRetarget) return null;
+      var nr = window.ArdyRetarget.normalizeRig(rig) || rig;
+      var f = function (a) { return (a || []).map(function (v) { return (+v).toFixed(3); }).join(','); };
+      return f(nr.left || nr.lateral) + '|' + f(nr.up) + '|' + f(nr.fwd);
+    } catch (e) { return null; }
+  }
+  function bankKey(phrase, frames) {
+    var sig = bankSig();
+    // 4A：长动作（>4s）单独一个 key，避免 8s 结果覆盖 4s 银行；短请求仍命中旧 key。
+    var lenTag = (frames && frames > 80) ? ('.len' + frames) : '';
+    return sig ? ('ardy.bank.v2.' + sig + lenTag + '.' + encodeURIComponent(phrase)) : null;
+  }
+  window.__ardyBankRead = function (phrase, frames) {
+    try {
+      var key = bankKey(phrase, frames);
+      if (!key) return null;
+      var raw = localStorage.getItem(key);
+      if (!raw) return null;
+      var b = JSON.parse(raw);
+      // ★ v2：旧 v1 缓存写于 footContacts 接入前，frames 里没有 contact ⇒ 脚 IK 永远“按速度自判”。
+      //   读到没有 contact 的旧条目直接作废，强制重新生成一次。
+      if (!b || b.v !== 2 || !Array.isArray(b.frames) || !b.frames.length) return null;
+      if (!b.frames[0] || !b.frames[0].contact) return null;
+      return b;
+    } catch (e) { return null; }
+  };
+  window.__ardyBankWrite = function (phrase, fps, frames, meta) {
+    try {
+      var key = bankKey(phrase, frames ? frames.length : 0);
+      if (!key || !frames || !frames.length) return false;
+      var b = Object.assign({ v: 2, ts: Date.now(), fps: fps || 20, frames: frames }, meta || {});
+      var raw = JSON.stringify(b);
+      if (raw.length > 400000) { log('warn', '[ardy] 动作银行写入跳过：单条 ' + raw.length + ' 字符过大'); return false; }
+      localStorage.setItem(key, raw);
+      return true;
+    } catch (e) { return false; }
+  };
+
   var worker = null, seq = 0, pending = new Map();
 
   function describePayload(c) {
@@ -83,10 +126,12 @@
         log('info', '[ardy] ' + (m.completed || 0) + '/' + (m.total || 0) + ' ' + (m.message || ''));
         return;
       }
-      if (m.type === 'generationChunk') {          // 流式推送（流式播放时用；这里只报形状）
-        log('info', '[ardy] 收到一帧: ' + describePayload(m.chunk));
-        var pc = pending.get(m.requestId);
-        if (pc) { pending.delete(m.requestId); pc.resolve(m); }
+      if (m.type === 'generationChunk') {
+        // ★ 4A 修：**不能在这里 resolve**。durationFrames=80 时 worker 会发 2 个 40 帧分块，
+        //   旧代码在第一块就 resolve + 删 pending ⇒ 第二块和 generationComplete 都成了“无人认领的事件”，
+        //   最终只播了前 40 帧（日志实证：请求 frames=80、生成完成 frames=40）。
+        //   现在只报形状，等 generationComplete 的完整 result（含 80 帧）。
+        log('info', '[ardy] 收到分块: ' + describePayload(m.chunk));
         return;
       }
       if (m.type === 'workerReady') {
@@ -103,6 +148,34 @@
       log('error', '[ardy] worker 错误: ' + ((e && (e.message || e.filename)) || '未知'));
     };
     return worker;
+  }
+
+  // ★ 4A 修（日志实证：预热还在加载时点第2步 ⇒ `Worker is already loading`）：
+  //   模型加载必须**串行共享同一个 Promise**：warmup / ardyPlay / ardyTest 都走这里。
+  var modelLoadPromise = null;
+  function loadModelOnce() {
+    if (window.__ardyModelReadyFor === worker) {
+      log('info', '[ardy] 模型已在内存，跳过加载');
+      return Promise.resolve(null);
+    }
+    if (modelLoadPromise) {
+      log('info', '[ardy] 模型加载已在进行，等待同一任务…');
+      return modelLoadPromise;
+    }
+    log('info', '[ardy] 开始加载模型（684MB，首次较慢）…');
+    var t0 = performance.now();
+    modelLoadPromise = post('loadModel', { baseUrl: new URL('ardy/fp32/', location.href).href }).then(
+      function (loaded) {
+        window.__ardyModelReadyFor = worker;
+        log('info', '[ardy] 模型就绪 ' + Math.round(performance.now() - t0) + 'ms');
+        return loaded;
+      },
+      function (err) {
+        modelLoadPromise = null;   // 失败允许下次重试
+        throw err;
+      }
+    );
+    return modelLoadPromise;
   }
 
   // ---- 生成参数：**跟上游模型卡的默认值对齐**（别再自己拍脑袋）----
@@ -122,8 +195,7 @@
       if (window.__ardyModelReadyFor === worker) { log('info', '[ardy] 预热跳过：模型已在内存'); return true; }
       var t0 = performance.now();
       log('info', '[ardy] 后台预热：开始加载模型（684MB，首次较慢）…');
-      var loaded = await post('loadModel', { baseUrl: new URL('ardy/fp32/', location.href).href });
-      window.__ardyModelReadyFor = worker;
+      var loaded = await loadModelOnce();
       var info = (loaded && loaded.model) || {};
       log('info', '[ardy] 后台预热完成 ' + Math.round(performance.now() - t0) + 'ms  id=' + info.id
         + ' fps=' + info.fps + ' → 之后 gen: 词条可即时生成');
@@ -139,11 +211,11 @@
     try {
       ensureWorker();
       var t0 = performance.now();
-      log('info', '[ardy] 开始加载模型（baseUrl=/ardy/fp32/，首次要读 684MB 并建 WebGPU 会话，耐心等）…');
-      var loaded = await post('loadModel', { baseUrl: new URL('ardy/fp32/', location.href).href });
+      log('info', '[ardy] 第1步自检：确保模型已加载（baseUrl=/ardy/fp32/）…');
+      var loaded = await loadModelOnce();
       var msLoad = Math.round(performance.now() - t0);
-      var info = loaded.model || {};
-      log('info', '[ardy] 模型加载完成 ' + msLoad + 'ms  id=' + info.id + ' variant=' + info.variant +
+      var info = (loaded && loaded.model) || {};
+      log('info', '[ardy] 第1步模型就绪 ' + msLoad + 'ms  id=' + info.id + ' variant=' + info.variant +
         ' fps=' + info.fps + ' gen=' + info.generationFrames + ' min=' + info.minFrames + ' max=' + info.maxFrames +
         ' manifest=' + (info.manifest ? '有' : '无'));
 
@@ -183,6 +255,18 @@
    *  opts.seed   ：指定种子（验收重试要换种子；不传 = 随机）
    *  opts.dryRun ：只生成 + 打签名，**不喂给桌宠播放**（验收用，避免"失败的姿势先闪一下"）
    */
+  // ★ 4A：把多段 generate 的 payload 拼成一条连续片段（每帧 81 个关节数 + 旋转/接触数组）。
+  function _ardyConcatPayload(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    var o = Object.assign({}, a);
+    o.frameCount = (+a.frameCount || 0) + (+b.frameCount || 0);
+    ['joints', 'motion', 'globalRotations', 'localRotations', 'rootPositions', 'footContacts', 'globalRootHeading'].forEach(function (k) {
+      if (a[k] && b[k]) o[k] = Array.prototype.slice.call(a[k]).concat(Array.prototype.slice.call(b[k]));
+    });
+    return o;
+  }
+
   window.ardyPlay = async function (prompt, opts) {
     opts = opts || {};
     try {
@@ -202,32 +286,60 @@
       }
       if (!window.ardyFeed) { log('error', '[ardy] pet.js 未提供 ardyFeed（版本不匹配？）'); return null; }
 
+      // 提示词要写清"举高"：模型对 "waves hello" 的理解常是胸前伸手挥（实测如此）
+      var p = prompt || 'a person raises the right hand high above the head and waves hello';
+
+      // ★ 4A 动作银行：同一词条 + 同一骨架 ⇒ 直接复用已生成/已验收的帧，跳过生成与模型加载。
+      //   `opts.cache` 显式开启（AI 路径/已验证路径），带 seed 的显式重生成永远不走缓存。
+      if (opts.cache === true && opts.seed == null) {
+        var banked = window.__ardyBankRead(p, opts.frames);
+        if (banked) {   // 4A：长动作走带 .len 的独立 key
+          log('info', '[ardy] 命中动作银行：' + p + '｜' + banked.frames.length + ' 帧'
+            + (banked.verified ? '（已验收）' : '') + '，跳过生成');
+          window.__ardyLastFrames = banked.frames;
+          window.__ardyLastGen = { phrase: p, seed: banked.seed, fps: banked.fps, frames: banked.frames, bank: true };
+          if (opts.dryRun) { log('info', '[ardy] dry-run（银行命中，不播放）'); return true; }
+          window.ardyFeed({ fps: banked.fps || 20, frames: banked.frames });
+          log('info', '[ardy] 已交给桌宠播放（银行）：' + banked.frames.length + ' 帧 @' + (banked.fps || 20) + 'fps');
+          return true;
+        }
+      }
+
       ensureWorker();
       var skel = await loadSkeleton();
       if (!skel) return null;
       var state = R.build(skel);
 
       // 模型只加载一次：worker 常驻内存，重复 loadModel 会重新下载 684MB + 重建会话（实测 6~12 秒）
-      if (window.__ardyModelReadyFor === worker) {
-        log('info', '[ardy] 模型已在内存，跳过加载');
-      } else {
-        var t0 = performance.now();
-        log('info', '[ardy] 开始加载模型（第 2 步）…');
-        await post('loadModel', { baseUrl: new URL('ardy/fp32/', location.href).href });
-        window.__ardyModelReadyFor = worker;   // 绑到 worker 实例上：worker 重建后自动失效
-        log('info', '[ardy] 模型就绪 ' + Math.round(performance.now() - t0) + 'ms，开始生成…');
-      }
+      // ★ 用 loadModelOnce 共享 Promise：预热还在加载时点生成不会触发 `Worker is already loading`。
+      await loadModelOnce();
 
-      // 提示词要写清"举高"：模型对 "waves hello" 的理解常是胸前伸手挥（实测如此）
-      var p = prompt || 'a person raises the right hand high above the head and waves hello';
       log('info', '[ardy] 生成中… prompt="' + p + '"');
       var t1 = performance.now();
       // ★ 种子每次随机：写死种子会让"每次生成一模一样的动作"，于是任何管线修复都无法改变画面内容
       //   （排查时会被误判成"改了没用"）。随机 + 把种子打进日志 → 既能换动作，也能复现某一次。
       var seed = (opts.seed != null) ? (opts.seed | 0) : ((Math.random() * 1e9) | 0);
-      log('info', '[ardy] seed=' + seed + (opts.dryRun ? '（dry-run：只生成不播放）' : ''));
-      var res = await post('generate', { mode: 'replace', prompt: p, seed: seed, durationFrames: 40, cfgWeight: ARDY_CFG_WEIGHT });
-      var payload = res.result || res.chunk || res;
+      // ★ 4A：默认生成 80 帧（4s，worker 内部按 40 帧窗口 + history 自动续），而不是 40 帧（2s）。
+      //   40 帧对“打招呼/挥手”常常只够起势；80 帧是当前 manifest 的 max_frames。
+      var wantFrames = (opts.frames != null) ? (opts.frames | 0) : 80;
+      wantFrames = Math.max(1, Math.min(240, wantFrames));   // 4A：最多 12s（按 80 帧窗口分段生成）
+      log('info', '[ardy] seed=' + seed + ' frames=' + wantFrames + (opts.dryRun ? '（dry-run：只生成不播放）' : ''));
+      // ★★ 4A：单次 worker 调用最多 80 帧（4s）。超过 80 帧时，第一段 replace、后续段 append；
+      //   worker 的 generationSession 会带 history（默认 40 帧）继续，所以拼接后是**一条连续动作**，
+      //   不会每 4 秒回站姿。
+      var _segs = [], _left = wantFrames;
+      while (_left > 0) { var _sn = Math.min(80, _left); _segs.push(_sn); _left -= _sn; }
+      var payload = null;
+      for (var _si = 0; _si < _segs.length; _si++) {
+        var _res = await post('generate', {
+          mode: (_si === 0 ? 'replace' : 'append'),
+          prompt: p, seed: seed, durationFrames: _segs[_si], historyFrames: 40, cfgWeight: ARDY_CFG_WEIGHT,
+        });
+        var _p = _res.result || _res.chunk || _res;
+        payload = _ardyConcatPayload(payload, _p);
+      }
+      if (!payload) throw new Error('生成没有返回 payload');
+      if (_segs.length > 1) log('info', '[ardy] 4A 长动作：' + _segs.join('+') + ' 段 → ' + wantFrames + ' 帧（连续播放）');
       var joints = payload.joints, fc = payload.frameCount || 0, fps = payload.fps || 20;
       log('info', '[ardy] 生成完成 ' + Math.round(performance.now() - t1) + 'ms  frames=' + fc + ' fps=' + fps);
       if (!joints || !fc) { log('error', '[ardy] 返回值里没有 joints / frameCount'); return null; }
@@ -263,20 +375,50 @@
       //   首帧可能是"手抬在胸前"这种本来就歪的姿势 → 拿它定基会让**整段动作系统性转过去**
       //   （实测表现："视角变了 + 上半身瞎动 + 抽象"）。规范静止姿势与动作无关、与 seed 无关，是稳定的北极星。
       var clipFrame = R.deriveFrame(state, null);
-      // 扭转来源：payload.globalRotations = frameCount × 27关节 × 9（每关节 3×3，含 roll）
-      var globalRot = payload.globalRotations || null;
-      var matIdx = 0, matCheckWorst = 1;
-      var retarget = function (fr) {
+      // ★ 4A：**不猜**旋转矩阵的行/列主序与全局/局部语义 —— 用首帧的“位置骨轴”当唯一判据：
+      //   矩阵把中性骨轴转过去 ≈ 当前帧骨轴 ⇒ 这份矩阵可用；否则继续用位置 aim（不拿坏 roll 毁画面）。
+      //   globalRotations / localRotations 都是 frameCount × 27 × 9。
+      var ROT_STRIDE = 27 * 9;
+      var rotCands = [];
+      var hasRot = function (arr) { return !!(arr && arr.length >= fc * ROT_STRIDE); };
+      if (hasRot(payload.globalRotations)) {
+        rotCands.push({ name: 'global/col', arr: payload.globalRotations, col: true });
+        rotCands.push({ name: 'global/row', arr: payload.globalRotations, col: false });
+      }
+      if (hasRot(payload.localRotations)) {
+        rotCands.push({ name: 'local/col', arr: payload.localRotations, col: true });
+        rotCands.push({ name: 'local/row', arr: payload.localRotations, col: false });
+      }
+      function rotSlice(arr, i) {
+        if (!arr) return null;
+        var a = i * ROT_STRIDE, b = a + ROT_STRIDE;
+        if (arr.length < b) return null;
+        return arr.subarray ? arr.subarray(a, b) : arr.slice(a, b);
+      }
+      var bestRot = null;
+      for (var ci = 0; ci < rotCands.length; ci++) {
+        var cc = rotCands[ci];
+        var probe = R.retargetFrame(state, raw[0], rig, {
+          applyRoot: false, frame: clipFrame,
+          mat: rotSlice(cc.arr, 0), matColMajor: cc.col
+        });
+        if (probe && typeof probe.matCheck === 'number' && (!bestRot || probe.matCheck > bestRot.score)) {
+          bestRot = { name: cc.name, arr: cc.arr, col: cc.col, score: probe.matCheck };
+        }
+      }
+      var useRot = !!(bestRot && bestRot.score >= 0.85);
+      if (bestRot) {
+        log('info', '[ardy] 旋转矩阵自检：' + bestRot.name + ' 最差点积 ' + bestRot.score.toFixed(3)
+          + (useRot ? ' ⇒ 启用 roll（补回绕骨轴自转）' : ' ⇒ 语义仍不符，继续用位置 aim（不冒险）'));
+      } else {
+        log('info', '[ardy] 没拿到旋转矩阵（local/global 都缺）⇒ 继续用位置 aim');
+      }
+      var retarget = function (fr, idx) {
         var o = R.retargetFrame(state, fr, rig, {
           applyRoot: true, scale: rootScale, frame: clipFrame,
-          // ★ 暂时关闭"矩阵扭转"：自检已判定这份 globalRotations 的语义与假设不符（点积 -0.94，
-          //   行/列主序都不对）→ 算出的扭转角不可信，会把骨骼 roll 弄坏（方向校验能过、但画面怪异）。
-          //   等语义确证后再启用；matCheck 自检保留，方便将来验证。
-          mat: null,
-          matColMajor: true
+          mat: useRot ? rotSlice(bestRot.arr, idx) : null,
+          matColMajor: useRot ? bestRot.col : true
         });
-        matIdx++;
-        if (o && typeof o.matCheck === 'number' && o.matCheck < matCheckWorst) matCheckWorst = o.matCheck;
         if (!o) return null;
         if (o.rootDelta) {
           if (!rootBase) rootBase = o.rootDelta.slice();
@@ -288,7 +430,7 @@
         }
         return o;
       };
-      var first = retarget(raw[0]);
+      var first = retarget(raw[0], 0);
       if (!first) { log('error', '[ardy] 首帧算不出坐标基：骨架关节名或每帧布局与 manifest 不符'); return null; }
       // ★ 落地脚（footContacts）：给 pet.js 的"脚部 IK 防滑步"用（第 5 项）。
       //   形状兼容：长度 = fc 的 [左,右] 行 / 长度 = 2×fc 的扁平表 / 每项是对象 {left,right}。
@@ -308,7 +450,7 @@
       };
       var frames = [{ aims: first.aims, root: first.rootDelta, contact: contactOf(0) }];
       for (i = 1; i < fc; i++) {
-        var out = retarget(raw[i]);
+        var out = retarget(raw[i], i);
         if (out && out.aims.length) frames.push({ aims: out.aims, root: out.rootDelta, contact: contactOf(i) });
       }
       // 坐标基漂移自检：证明"逐帧重算 basis"到底会歪多少（也是这条 bug 的回归哨兵）
@@ -318,9 +460,11 @@
         var dF = clipFrame.fwd[0] * midFrame.fwd[0] + clipFrame.fwd[1] * midFrame.fwd[1] + clipFrame.fwd[2] * midFrame.fwd[2];
         log('info', '[ardy] 坐标基漂移自检：up·中帧=' + dU.toFixed(3) + ' fwd·中帧=' + dF.toFixed(3) +
           '（<0.99 = 脚/臂在动；已固定用首帧的基，否则身体会跟着歪）');
-        // 扭转/矩阵布局自检：矩阵给的骨轴方向应 ≈ 位置推的骨轴方向（差很多 = 行/列主序要翻）
-        log('info', '[ardy] 扭转自检：矩阵骨轴 vs 位置骨轴 最差点积=' + matCheckWorst.toFixed(3) +
-          (matCheckWorst > 0.9 ? ' ✓（行主序正确）' : ' ← 需要把 matColMajor 改成 true'));
+        // 扭转/矩阵布局自检：矩阵给的骨轴方向应 ≈ 位置推的骨轴方向（差很多 = 行/列主序或全局/局部语义不对）
+        if (bestRot) {
+          log('info', '[ardy] 扭转自检：' + bestRot.name + ' 最差点积=' + bestRot.score.toFixed(3)
+            + (useRot ? ' ✓（已启用 roll）' : ' ← 未启用（继续位置 aim）'));
+        }
       }
       log('info', '[ardy] 根位移：比例 ' + rootScale.toFixed(3) + '，水平最大 ' + rootMax.toFixed(3) +
         '，竖向最大 ' + rootMaxY.toFixed(3) + '（模型单位；竖向 ≈0 说明这段动作没有起落/蹲下，水平 ≈0 说明是原地）');
@@ -419,6 +563,10 @@
         sigFirst: sigFirst, sigMid: sigMid, sigSamp: sigSamp,
         rootMax: rootMax, rootMaxY: rootMaxY,
       };
+      if (opts.cache === true && opts.seed == null) {   // 长动作用独立 key，不再跳过
+        var saved = window.__ardyBankWrite(p, fps, frames, { seed: seed, verified: false });
+        if (saved) log('info', '[ardy] 已存入动作银行：' + p + '｜' + frames.length + ' 帧（未验收）');
+      }
       if (opts.dryRun) {
         log('info', '[ardy] dry-run：已生成 ' + frames.length + ' 帧但**不播放**（供验收判定）');
         return true;
@@ -463,7 +611,8 @@
     return null;
   };
   // 判据阈值**全部来自实测证据**（ardy-phrases.json 的 evidence），不是凭空设的：
-  //   膝：站直 12~28°，开合跳中帧 65° ⇒ 屈膝阈值 45°
+  //   膝：站直 12~28°，开合跳中帧 65° ⇒ 屈膝阈值 **35°**（2026-11-02 从 45 下调：
+  //   同一条 verified 词条两次实测只到 39~40°，被 45° 卡掉后回退成 hands_up —— 观感比"膝弯得少一点"更差）
   //   骨盆 yaw：举手挥手 4.4°（用它判"身体没整体转"）⇒ bodyYawSmall 阈值 12°
   //   低头/抬头：头相对髋的"前"分量变化 ≥0.06（单位向量）
   //   环顾：头 yaw 跨帧变化 ≥12°；敬礼：手↔头 ≤ 0.8×（髋↔头）
@@ -510,7 +659,7 @@
     need('handAboveShoulder', Math.max(maxR, maxL) > 0, '单手最高 ' + Math.max(maxR, maxL).toFixed(2));
     need('bothHandsAboveShoulder', (maxR > 0 && maxL > 0), '右' + maxR.toFixed(2) + ' 左' + maxL.toFixed(2));
     need('handsDown', (maxR < 0 && maxL < 0), '右' + maxR.toFixed(2) + ' 左' + maxL.toFixed(2));
-    need('kneeBend', maxKnee >= 45, '最大膝角 ' + maxKnee.toFixed(0) + '°');
+    need('kneeBend', maxKnee >= 35, '最大膝角 ' + maxKnee.toFixed(0) + '°');
     need('armsSwing', swing >= 0.05, '手左右摆幅 ' + swing.toFixed(3));
     need('headPitchForward', (hFwdMax - first.headFwd) >= 0.06, '头前分量 ' + first.headFwd.toFixed(2) + '→' + hFwdMax.toFixed(2));
     need('headPitchUp', (first.headFwd - hFwdMin) >= 0.06, '头前分量 ' + first.headFwd.toFixed(2) + '→' + hFwdMin.toFixed(2));
@@ -528,15 +677,23 @@
     var hit = await window.ardyPhraseExpect(phraseOrLabel);
     if (!hit) {
       log('info', '[ardy] 验收：「' + phraseOrLabel + '」不在词表 verified/candidates 里 ⇒ 不做判定，直接生成播放');
-      var okPlain = await window.ardyPlay(phraseOrLabel);
+      var okPlain = await window.ardyPlay(phraseOrLabel, { cache: true, frames: opts.frames });
       window.ardyLastVerdict = { phrase: phraseOrLabel, ok: !!okPlain, pass: null, skip: true };
       return { ok: !!okPlain, pass: null, skip: true };
+    }
+    // ★ 4A：已验收的动作银行命中 ⇒ 直接播放，不再生成/验收（同一词条第二次开始就是瞬发）。
+    var _banked = window.__ardyBankRead(hit.phrase, opts.frames);
+    if (_banked && _banked.verified) {   // 长动作走 .len key
+      log('info', '[ardy] 命中已验收动作银行：' + hit.phrase + '｜' + _banked.frames.length + ' 帧（跳过生成/验收）');
+      if (!opts.noPlay) window.ardyFeed({ fps: _banked.fps || 20, frames: _banked.frames });
+      window.ardyLastVerdict = { phrase: hit.phrase, label: hit.label, ok: true, pass: true, attempt: 0, approx: false, cached: true, lines: _banked.verdict || [] };
+      return { ok: true, pass: true, attempt: 0, approx: false, cached: true, verdict: null };
     }
     var expect = hit.expect || {};
     var lastV = null, lastGen = null;
     for (var attempt = 1; attempt <= 2; attempt++) {
       var seed = (Math.random() * 1e9) | 0;
-      var okGen = await window.ardyPlay(hit.phrase, { seed: seed, dryRun: true });
+      var okGen = await window.ardyPlay(hit.phrase, { seed: seed, dryRun: true, frames: opts.frames });
       if (!okGen) { log('warn', '[ardy] 验收：第 ' + attempt + ' 次生成失败（seed=' + seed + '）'); continue; }
       lastGen = window.__ardyLastGen || null;
       lastV = lastGen ? verdictOf(expect, lastGen) : null;
@@ -544,6 +701,12 @@
         + (!lastV ? '无法判定' : (lastV.checked === 0 ? '判据未校准（不拦）' : (lastV.pass ? '通过 ✓' : '未过 ✗')))
         + (lastV ? (' ｜ ' + lastV.lines.join('　')) : ''));
       if (lastV && lastV.pass) {
+        if (lastGen && lastGen.frames && lastGen.frames.length) {
+          var _okBank = window.__ardyBankWrite(hit.phrase, lastGen.fps, lastGen.frames, {
+            verified: true, verdict: lastV.lines, attempt: attempt, seed: lastGen.seed,
+          });
+          if (_okBank) log('info', '[ardy] 已存入动作银行（已验收）：' + hit.phrase + '｜' + lastGen.frames.length + ' 帧（下次瞬发）');
+        }
         if (!opts.noPlay && lastGen && lastGen.frames) window.ardyFeed({ fps: lastGen.fps, frames: lastGen.frames });
         window.ardyLastVerdict = { phrase: hit.phrase, label: hit.label, ok: true, pass: true, attempt: attempt, approx: (lastV.checked === 0), lines: lastV.lines };
         log('info', '[ardy] 达标 ⇒ 播放（第 ' + attempt + ' 次生成）' + (lastV.checked === 0 ? '；注：本条判据未校准，"通过"只是不拦' : ''));

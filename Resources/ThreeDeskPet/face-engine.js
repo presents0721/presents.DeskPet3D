@@ -1969,6 +1969,12 @@ var SoullinkFace = (() => {
       };
       const list = Array.isArray(names) ? names.filter(Boolean) : [];
       const all = resolveProfile(profile, list);
+      // ★ 有些模型的 happy/Joy 是**闭眼笑**（morph 与 blink 共用顶点）。pet.js 会做顶点检测并通过
+      //   setEyeCloseHappy(true) 告知；这里把 AU 里的 happy 目标改成 relaxed(通常 Fun=睁眼笑)。
+      //   只换目标名，不改 AU 数值 ⇒ 仍是 Soullink 的 AU 驱动，只是选了一张合适的脸。
+      if (this._eyeCloseHappy && list.indexOf("relaxed") >= 0) {
+        for (const b of all) for (const r of b.resolved) if (r.name === "happy") r.name = "relaxed";
+      }
       const seenAu = /* @__PURE__ */ new Set();
       this.bindings = all.filter((x) => {
         if (!x.supported) return true;
@@ -1984,6 +1990,8 @@ var SoullinkFace = (() => {
         aus: this.bindings.filter((x) => x.supported).map((x) => x.au)
       };
     }
+    /** pet.js 的顶点检测结果：happy 是否是闭眼笑（true 时 AU 目标改用 relaxed） */
+    setEyeCloseHappy(on) { this._eyeCloseHappy = !!on; }
     /** 情绪标签 + 强度（0..1）；未知标签不抛（退回 neutral），免得一层坏数据打断整帧 */
     setEmotion(label, intensity = 1) {
       const key = String(label || "neutral").toLowerCase();

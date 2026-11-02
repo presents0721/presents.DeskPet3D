@@ -1,4 +1,4 @@
-/* 具身动作合成器（纯 JS，零依赖）
+﻿/* 具身动作合成器（纯 JS，零依赖）
  *
  * 把"关键帧 spec(角度/秒)"合成成 pet.js 需要的数据：
  *   { fps, frames: [ { joints: { "<VRM骨骼名>": [x,y,z,w] } }, ... ] }
@@ -78,6 +78,9 @@
     rArmUp: { bone: 'rightUpperArm', kind: 'lift' },
     lArmFwd: { bone: 'leftUpperArm', kind: 'fwd' },
     rArmFwd: { bone: 'rightUpperArm', kind: 'fwd' },
+    // ★ v11.62：水平内收（拥抱/抱臂必需；旧通道表只有抬/前摆，少了“把手臂收到身体中线”这一维）。
+    lArmIn: { bone: 'leftUpperArm', kind: 'in' },
+    rArmIn: { bone: 'rightUpperArm', kind: 'in' },
     // ⚠ **实测无效（2026-10-16）**：`ArmTwist`（上臂自转）在 VRM 的 normalized humanoid bone 上
     //   **不起作用** —— 自转是"绕骨骼自身轴"，而归一化骨只保证**骨骼方向**，自转分量被丢弃。
     //   证据：给 `salute` 加了 `rArmTwist: -52`（想拧出"肘尖朝外"），日志确认新参数已加载（通道 9），
@@ -268,6 +271,8 @@
       if (k === 'lift') { a = vcross(dRest, rig.up); if (vlen(a) < 0.25) a = vcross(dRest, vscale(rig.lateral, side)); }
       else if (k === 'fwd') { a = vcross(dRest, rig.fwd); if (vlen(a) < 0.25) a = vcross(dRest, rig.up); }
       else if (k === 'out') { a = vcross(dRest, vscale(rig.lateral, side)); if (vlen(a) < 0.25) a = vcross(dRest, rig.up); }
+      else if (k === 'in') { a = vscale(rig.up, -side); }   // 绕身体竖轴向内收：左 -up、右 +up
+
       else a = dRest;                                       // 兜底：当自转处理
       if (vlen(a) < 1e-6) return null;
       a = qRotate(parentQ, vnorm(a));
@@ -275,6 +280,41 @@
     if (vlen(a) < 1e-6) return null;
     var axis = vnorm(a);
     return flip === 1 ? axis : vscale(axis, -1);
+  }
+
+  // ==================== 关节生理范围（硬约束）====================
+  // 为什么需要：AI / 手写只给"转多少度"，原本没有解剖约束 ⇒ 负的肘 = 反折、90° 的肘外摆
+  //   = 小臂横着掰、180° 的转掌 = 手背朝前。画面上就是"手臂被折断，正常人做不到"。
+  // 这里在**通道值进入轴角旋转之前**统一夹住（包括惯性偏移叠加后的值）—— 最后一道闸：
+  //   无论来源是 AI、预设还是惯性，都不可能绕过。范围按真人活动度给，故意比"标准"宽一点，
+  //   不限制表达，只挡反关节。
+  // ⚠ 与 embodied-validate.js 的 ANATOMY 表保持同步（那边负责给 AI 报"哪一段写错了"）。
+  var JOINT_LIMITS = {
+    // 单轴铰链：肘/膝只能往一个方向屈（负值 = 反折）
+    lElbow: [0, 145], rElbow: [0, 145],
+    lKnee: [0, 150], rKnee: [0, 150],
+    // 小臂/手：ElbowSide 是"摆手"的表达性假轴，超过 ±35 就会看起来像横着掰断
+    lElbowSide: [-35, 35], rElbowSide: [-35, 35],
+    lElbowTwist: [-85, 85], rElbowTwist: [-85, 85],
+    lHandTurn: [-85, 85], rHandTurn: [-85, 85],
+    lHandBend: [-55, 70], rHandBend: [-55, 70],
+    lHandSide: [-25, 25], rHandSide: [-25, 25],
+    // 肩：抬 / 前摆（负 = 向后下方）
+    lArmUp: [-40, 175], rArmUp: [-40, 175],
+    lArmFwd: [-65, 110], rArmFwd: [-65, 110],
+    lArmIn: [-80, 80], rArmIn: [-80, 80],
+    // 腿：前后摆 / 侧开 / 自转；踝与脚趾
+    lLegFwd: [-55, 120], rLegFwd: [-55, 120],
+    lLegSide: [-75, 75], rLegSide: [-75, 75],   // v11.63：横向开腿放宽（旧 ±45 连大步/劈叉都打不开）
+    lLegTwist: [-60, 60], rLegTwist: [-60, 60],
+    lAnkle: [-40, 55], rAnkle: [-40, 55],
+    lAnkleSide: [-30, 30], rAnkleSide: [-30, 30],
+    lToes: [-20, 60], rToes: [-20, 60]
+  };
+  function clampJoint(ch, v) {
+    var lim = JOINT_LIMITS[ch];
+    if (!lim || typeof v !== 'number' || !isFinite(v)) return v;
+    return v < lim[0] ? lim[0] : (v > lim[1] ? lim[1] : v);
   }
 
   // ==================== 预设动作 ====================
@@ -324,6 +364,17 @@
       { pose: { lArmUp: 140, rArmUp: 140, spinePitch: -12, headPitch: -12 }, dur: 0.5, ease: 'inout' },
       { pose: { lArmUp: 120, rArmUp: 120, spinePitch: -8, headPitch: -10 }, dur: 0.5, ease: 'inout' }
     ] },
+    // ★ v11.62「拥抱」：旧通道表只有 ArmFwd，手臂会停在身体两侧（用户：“拥抱只往前伸一点点”）。
+    //   ArmIn = 水平内收（绕身体竖轴把上臂收到中线）；拥抱必须 ArmFwd + ArmIn + Elbow 三件套。
+    hug: { smooth: 0.25, steps: [
+      // 拥抱是“往前伸+轻轻收拢”，不是把自己抱紧：ArmIn 过大 + Elbow 过大会变成摸对侧肩膀。
+      { pose: { lArmFwd: 55, rArmFwd: 55, lArmIn: 2, rArmIn: 2, lElbow: 15, rElbow: 15, lShoulderFwd: 4, rShoulderFwd: 4, spinePitch: 3, headPitch: 4 }, dur: 0.45, ease: 'out' },
+      { pose: { lArmFwd: 85, rArmFwd: 85, lArmIn: 6, rArmIn: 6, lElbow: 30, rElbow: 30, lShoulderFwd: 8, rShoulderFwd: 8, spinePitch: 6, headPitch: -2 }, dur: 0.50, ease: 'inout' },
+      { pose: { lArmFwd: 90, rArmFwd: 90, lArmIn: 10, rArmIn: 10, lElbow: 40, rElbow: 40, lShoulderFwd: 10, rShoulderFwd: 10, spinePitch: 8, headPitch: -4, headRoll: 4 }, dur: 0.45, ease: 'inout' },   // 收紧（保持手在前，不交叉）
+      { dur: 0.35, ease: 'linear' },
+      { pose: { lArmFwd: 0, rArmFwd: 0, lArmIn: 0, rArmIn: 0, lElbow: 0, rElbow: 0, lShoulderFwd: 0, rShoulderFwd: 0, spinePitch: 0, headPitch: 0, headRoll: 0 }, dur: 0.70, ease: 'inout' }
+    ] },
+
     // ── 手型（手指通道落地后才有）──
     // 只动手，不动手臂 ⇒ 想"举拳呐喊"就 overlay 到 hands_up 上：
     //   { overlay: { base: 'hands_up', add: { fingers: { l:'fist', r:'fist' } } } }
@@ -623,13 +674,13 @@
     } else {
       // 蹲：按深度缩短"髋→踝"距离，脚不动；留 10% 余量，避免解到完全折叠（那里腿朝向会翻）
       var maxDrop = Math.max(0, L0 - Math.abs(a - b) - 1e-3);
-      var dropWanted = crouch * maxDrop * 0.9;
+      var dropWanted = crouch * maxDrop * 0.95;
       // ★★ v11.14「踝背屈极限」——治用户 2026-10-15 报的"蓄力像踩棉花、整个人往下陷"：
       //   脚贴地时蹲越深，小腿越向后倾 ⇒ 踝背屈越大；crouch=0.95 会解出 **lAnkle 78°**，
       //   而正常人踝背屈只有 ~30°。超过它就不是"蹲"，而是"把脚折进腿里"（髋几乎贴地 = 陷下去）。
       //   这里按"踝不超限"反推真正能用的最大下沉量（二分 24 次，一次性开销可忽略）。
       //   想要更深的蹲，只能用别的手段表达（提踵 / 空中收腿），不能靠把踝掰过去。
-      var ANKLE_MAX = deg2rad(32);
+      var ANKLE_MAX = deg2rad(60);   // v11.63：放宽背屈上限（32° => 只能蹲一半；60° 允许深蹲+脚跟自然抬起，最终角度再由 JOINT_LIMITS 兜底）
       var dLo = 0, dHi = Math.max(dropWanted, maxDrop * 0.9);
       for (var bci = 0; bci < 24; bci++) {
         var dMid = (dLo + dHi) / 2;
@@ -921,6 +972,13 @@
       seq.push({ pose: zero, dur: 0.4, ease: 'inout', _tail: true });
     }
 
+    // 末尾是“回中性”的空段且太短 ⇒ 拉到 0.5s（自然落地；避免最后 0.3s 啪一下到位）
+    if (!spec.chain && seq.length) {
+      var _last0 = seq[seq.length - 1], _lp0 = _last0.pose || {}, _z0 = true;
+      for (var _c0 in _lp0) { if (Math.abs(+_lp0[_c0] || 0) > 1e-6) { _z0 = false; break; } }
+      if (_z0 && !_last0._tail && (+_last0.dur || 0) < 0.5) seq[seq.length - 1] = Object.assign({}, _last0, { dur: 0.5 });
+    }
+
     var frames = [];
     // ★★ v11.16「腿部限速」——治"腿/脚像弹簧弹回、幅度大"（用户 2026-10-16 反馈，日志实证
     //   `瞬跳捕获：leftLowerLeg 单帧跳 29°`）：不管是预置写得急、还是 AI 临时生成的动作，
@@ -952,6 +1010,7 @@
       if (/^(l|r)(Arm|Shoulder)/.test(ch)) return 0.40; // 大臂 / 肩
       if (/^(l|r)(Knee|Leg|Ankle)/.test(ch)) return 0.22; // 腿：轻一点（避免又出"弹簧感"）
       if (/^(head|neck)/.test(ch)) return 0.30;
+      if (/^(hips|spine|chest)/.test(ch)) return 0.22;   // 躯干也吃一点惯性：否则上身与手臂完全同步 = 僵硬
       return 0;
     }
     // ★★ v11.23b「**速度项**（逐级滞后）」—— 用户："起码得让大臂小臂分开都要动，不能跟个棍一样甩"。
@@ -970,6 +1029,7 @@
       if (/^(l|r)(Arm|Shoulder)/.test(ch)) return 0.35; // 大臂：接近"意图"
       if (/^(l|r)(Knee|Leg|Ankle)/.test(ch)) return 0.30;
       if (/^(head|neck)/.test(ch)) return 0.35;
+      if (/^(hips|spine|chest)/.test(ch)) return 0.30;
       return 0;
     }
     // ★★ v11.23b「**幅度自适应限幅**」—— 用户问："对于动作幅度不同的动作，会有相应的判定吗？"
@@ -1012,6 +1072,25 @@
     // ★ 手指初值：剪辑级 `spec.fingers` 只作**起始**手型（不写 = 从"不弯"开始）。
     //   每段可由 `step.fingers` 改写 ⇒ 手指也能"有先后顺序 + 有过渡"（见下面逐段插值）。
     var fingerState = fingerJoints(spec.fingers, rig) || {};
+    // ★★ 自动肘部跟随（治"大臂动、小臂像棍"）：AI / 预设只写 ArmUp/ArmFwd 时，前臂不会自己弯。
+    //   真实人体里上臂一抬，肘会自然屈一点、并**滞后**一拍（惯性）。
+    //   规则：只在整条 spec **从未手写**该侧 Elbow 时启用；按 ArmUp/ArmFwd 幅度算目标角，再一阶滞后追踪。
+    var _authElbL = false, _authElbR = false;
+    var _authHandL = false, _authHandR = false, _authRoll = false;
+    for (var _ae = 0; _ae < seq.length; _ae++) {
+      var _ap = seq[_ae] && seq[_ae].pose;
+      if (_ap && _ap.lElbow !== undefined) _authElbL = true;
+      if (_ap && _ap.rElbow !== undefined) _authElbR = true;
+      if (_ap && _ap.lHandTurn !== undefined) _authHandL = true;
+      if (_ap && _ap.rHandTurn !== undefined) _authHandR = true;
+      if (_ap && (_ap.hipsRoll !== undefined || _ap.spineRoll !== undefined || _ap.headRoll !== undefined)) _authRoll = true;
+    }
+    // ★★ 肘部二阶弹簧（治"生硬 / 没有缓冲惯性"）：只做一阶滞后时，上臂一停、肘也立刻停，
+    //   看不出重量；这里改成**欠阻尼弹簧**（略过冲再回稳）= 真实小臂的惯性拖尾。
+    //   手写了 Elbow 的 spec 也照样吃弹簧（目标=手写值），不会改你的姿势，只改"怎么到那儿"。
+    var _elbL = 0, _elbVL = 0, _elbR = 0, _elbVR = 0;
+    var _elbW0 = 10.0, _elbZ = 0.60, _elbSub = 2;   // ω≈1.6Hz、ζ0.6（轻微过冲）
+    var _elbH = (typeof fps === 'number' && fps > 0) ? (1 / (fps * _elbSub)) : (1 / 40);
     for (var s = 0; s < seq.length; s++) {
       var step = seq[s] || {};
       var dur = Math.max(0.05, +(step.dur || 0.4));
@@ -1062,6 +1141,23 @@
             ang[lkN] = hv * (1 - _wLeg) + plan.legs[lkN] * _wLeg;
           }
         }
+        // ★★ 肘部：目标角 = 手写值（若有），否则按上臂幅度自动给一个自然弯曲；再用二阶弹簧追随。
+        var _tgtL = _authElbL
+          ? (+ang.lElbow || 0)
+          : Math.min(70, 0.28 * Math.abs(+ang.lArmUp || 0) + 0.45 * Math.abs(+ang.lArmFwd || 0));
+        for (var _sl = 0; _sl < _elbSub; _sl++) {
+          var _accL = (_tgtL - _elbL) * _elbW0 * _elbW0 - 2 * _elbZ * _elbW0 * _elbVL;
+          _elbVL += _accL * _elbH; _elbL += _elbVL * _elbH;
+        }
+        ang.lElbow = clampJoint('lElbow', _elbL);
+        var _tgtR = _authElbR
+          ? (+ang.rElbow || 0)
+          : Math.min(70, 0.28 * Math.abs(+ang.rArmUp || 0) + 0.45 * Math.abs(+ang.rArmFwd || 0));
+        for (var _sr = 0; _sr < _elbSub; _sr++) {
+          var _accR = (_tgtR - _elbR) * _elbW0 * _elbW0 - 2 * _elbZ * _elbW0 * _elbVR;
+          _elbVR += _accR * _elbH; _elbR += _elbVR * _elbH;
+        }
+        ang.rElbow = clampJoint('rElbow', _elbR);
         // 自顶向下逐骨骼：own = 本骨世界增量（给 pet.js 用），total = own·父链累计（传给子骨推轴）
         // ★★ v11.17「活人感联动层」（用户：\"只动必须动的，其他部分太僵硬，没活人感\"）：
         //   把主通道的值按**真人比例分摊到相邻骨**。骨骼链是累加的 ⇒ 分散后头部/躯干朝向几乎不变，
@@ -1128,12 +1224,29 @@
         var _wbR = Math.min(14, Math.max(0, (_ru4 - 45) * 0.14));
         if (_wbR > (+ang.rHandBend || 0)) ang.rHandBend = _wbR;
         //   ⑦ 身体前倾时手臂**被动微摆**（体检发现：`bow` 鞠躬时手臂全程 0 档 = 焊在身侧）：
+        //   ⑧ 抬臂自动带**掌心朝向**（治“手臂抬起来手心朝外”）：侧抬上臂会把手一起带转，真人会自然旋前/旋后。
+        //      只在整条 spec 没手写该侧 HandTurn 时，按抬起高度给一个反向补偿（左正右负，与内置 wave 的 -35 一致），上限 45°。
+        if (!_authHandL) ang.lHandTurn = Math.min(45, Math.max(0, +ang.lArmUp || 0) * 0.38);
+        if (!_authHandR) ang.rHandTurn = -Math.min(45, Math.max(0, +ang.rArmUp || 0) * 0.38);
         //      前倾超过 15° 时手臂相对躯干向后让一点点（封顶 8°）—— 世界坐标下手更自然地下垂/轻晃。
         var _spF = _linkOn ? (+ang.spinePitch || 0) : 0;
         if (_spF > 15) {
           var _abk = -Math.min(8, (_spF - 15) * 0.25);
           if (_abk < (+ang.lArmFwd || 0)) ang.lArmFwd = _abk;   // 只往"更后摆"的方向补
           if (_abk < (+ang.rArmFwd || 0)) ang.rArmFwd = _abk;
+        }
+
+        //   ⑨ 重心跟随（治“上半身动、下半身焊死”）：一只手臂明显更活跃时，骨盆向对侧让一点、脊柱/头回一点。
+        //      只做小角度（≤2.4°），腿根会抵消骨盆旋转 ⇒ 脚不滑；两边同样活跃（如双手举）不触发。
+        if (_linkOn && !_authRoll) {
+          var _actL = Math.abs(+ang.lArmUp || 0) * 0.55 + Math.abs(+ang.lArmFwd || 0) * 0.45 + Math.abs(+ang.lElbow || 0) * 0.15;
+          var _actR = Math.abs(+ang.rArmUp || 0) * 0.55 + Math.abs(+ang.rArmFwd || 0) * 0.45 + Math.abs(+ang.rElbow || 0) * 0.15;
+          var _lean = Math.max(-1, Math.min(1, (_actR - _actL) / 70));
+          if (Math.abs(_lean) > 0.02) {
+            ang.hipsRoll = (+ang.hipsRoll || 0) + _lean * 2.4;
+            ang.spineRoll = (+ang.spineRoll || 0) - _lean * 1.6;
+            ang.headRoll = (+ang.headRoll || 0) - _lean * 0.8;
+          }
         }
 
         // ★ v11.16 腿限速（见上面 LEG_MAX_STEP 的注释）
@@ -1204,7 +1317,7 @@
           if (list) {
             own = QI.slice();
             for (var li = 0; li < list.length; li++) {
-              var ch = list[li], v = ang[ch] + (offMap && offMap[ch] ? offMap[ch] : 0);   // ★ v11.23 叠加惯性偏移（见 offMap 的说明）
+              var ch = list[li], v = clampJoint(ch, ang[ch] + (offMap && offMap[ch] ? offMap[ch] : 0));   // ★ v11.23 惯性偏移 + ★ 关节硬约束
               if (Math.abs(v) < 1e-6) continue;
               var ax = axisFor(ch, rig, bone, pqAxis);
               if (!ax) continue;
@@ -1246,7 +1359,7 @@
     //   ⇒ 两段之间会"刹一下再起步"，看上去就是"衔接不顺、一顿一顿"。
     // 做法：逐骨对四元数做一次**轻量低通**（本帧与"前后帧中点"之间 slerp 一小步）。
     //   首末帧**不动** ⇒ "起点=起始手型、终点=中性"仍精确成立。只处理**前后帧都有该骨**的帧。
-    var smoothW = (spec.smooth === undefined) ? 0.30 : Math.max(0, Math.min(1, +spec.smooth || 0));
+    var smoothW = (spec.smooth === undefined) ? 0.22 : Math.max(0, Math.min(1, +spec.smooth || 0));
     if (smoothW > 0 && frames.length > 2) {
       var allNames = {}, nk;
       for (var sfi = 0; sfi < frames.length; sfi++) { var sj = frames[sfi].joints; for (nk in sj) allNames[nk] = 1; }
@@ -1274,7 +1387,7 @@
     // 整体转身（度，正的=往角色自己的左边转）：绕"角色竖直轴"转**整个模型**。
     // 为什么必须单独有它：hipsYaw 的语义是"骨盆相对腿"（腿钉在原地，只能小角度；
     // 拧到 90° 以上就是把胯相对腿拧死 = 反关节）。要大幅转身 / 背对观众，必须转整体。
-    var turn = (typeof spec.turn === 'number' && isFinite(spec.turn)) ? Math.max(-180, Math.min(180, spec.turn)) : 0;
+    var turn = (typeof spec.turn === 'number' && isFinite(spec.turn)) ? Math.max(-720, Math.min(720, spec.turn)) : 0;
     // 手指已在上面**逐段**写入每一帧（含自动补的那段"回到中性"：它没写 fingers ⇒ 手指保持不变，
     // 与原"整段常量"行为一致）。旧版这里是把整段常量一次性写进所有帧，已废弃。
     // 把"这次到底做了什么"一并交出去：调用方据此打日志/告警。
@@ -1315,6 +1428,7 @@
 
   var api = {
     CHANNELS: CHANNELS, PRESETS: PRESETS, BONE_ORDER: BONE_ORDER, BONE_CHAIN: BONE_CHAIN,
+    JOINT_LIMITS: JOINT_LIMITS, clampJoint: clampJoint,                                     // 关节生理硬约束（校验器同用）
     DEFAULT_RIG: DEFAULT_RIG, channelNames: channelNames, compose: compose, preset: preset,
     registerPreset: registerPreset,
     solveKnee: solveKnee, legPlan: legPlan,                                                 // 腿部解析 IK（便于离线自测）

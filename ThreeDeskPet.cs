@@ -122,13 +122,20 @@ public partial class ThreeDeskPet(
         bridge?.SendMessage("motion", new { name = motion, seconds });
         return Task.CompletedTask;
     }
+    public void SetPosture(string? pose)
+    {
+        string p = (pose ?? "").Trim().ToLowerInvariant();
+        if (p != "stand" && p != "sit" && p != "sit_full" && p != "lieback") return;
+        autoSit = (p == "sit");
+        bridge?.SendMessage("posture", new { pose = p });
+    }
 
     /// <summary>下发一次「生成式动作」：一句英文 → 本地模型现场生成 → 重定向到当前 VRM → 播放。
     /// 前端会回报结果；失败时由前端退回预置动作（见 pet.js 的 bodyact_prompt 处理）。</summary>
-    public void GenerateMotion(string prompt)
+    public void GenerateMotion(string prompt, double? seconds = null)
     {
         if (string.IsNullOrWhiteSpace(prompt)) return;
-        bridge?.SendMessage("bodyact_prompt", new { prompt });
+        bridge?.SendMessage("bodyact_prompt", new { prompt, seconds });
     }
 
     // ── 生成式动作词条（<motion option="gen:标签"/> 用）────────────────────────────
@@ -270,6 +277,10 @@ public partial class ThreeDeskPet(
 
     /// <summary>具身表情开关变化时触发（同样按需注册/注销 AI 工具）。</summary>
     public event Action? EmbodiedExpressionChanged;
+
+    /// <summary>是否注入 bodyexpress 的长文档（关闭=省上下文，靠记忆插件；工具仍注册）。</summary>
+    public bool BodyExpressDocEnabled => Configuration.BodyExpressDoc;
+    public event Action? BodyExpressDocChanged;
 
     /// <summary>下发一次具身表情：情绪 + 强度 + 保持秒数 + 眼嘴显式控制（-1 = 不干预）。</summary>
     public void ShowEmbodiedExpression(string emotion, double intensity = 0.8, double hold = 8, double mouth = -1, double eyes = -1,
@@ -806,7 +817,7 @@ public partial class ThreeDeskPet(
         string? resolvedFile;
         string? resolvedType;
 
-        // 1) 绝对路径直接指向 .vrm/.pmx 文件：直接用（支持把模型放在任意盘，如 E:\VRM模型\...）
+        // 1) 绝对路径直接指向 .vrm/.pmx 文件：直接用（支持把模型放在任意目录）
         if (Path.IsPathRooted(modelName) && !Directory.Exists(modelName))
         {
             if (File.Exists(modelName) &&
@@ -837,7 +848,7 @@ public partial class ThreeDeskPet(
         string motionsDir = Path.Combine(dir, "motions");
         if (Directory.Exists(motionsDir))
             ScanMotionDir(motionsDir, motions);
-        // 额外动作目录（如 E:\VRMA 这类动作库）：递归扫描，与模型 motions 合并，无需拷贝
+        // 额外动作目录（动作库）：递归扫描，与模型 motions 合并，无需拷贝
         if (!string.IsNullOrWhiteSpace(Configuration.ExtraMotionPaths))
         {
             foreach (string p in Configuration.ExtraMotionPaths.Split(new char[] { ';', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -848,7 +859,7 @@ public partial class ThreeDeskPet(
         }
 
         // ★★ v11.49：只留**与当前模型配套**的动作格式。
-        //   用户实测（E:\VRMA）：66 个 .vrma + 44 个 .vmd —— 而这两类基本是**同一批舞的两个格式副本**
+        //   实测动作库：66 个 .vrma + 44 个 .vmd —— 而这两类基本是**同一批舞的两个格式副本**
         //   （每个曲包里 vmd/ 与 vrma/ 各放一份）。全列 ⇒ AI 看到 200+ 个名字：
         //     ① 吃大量 token；② 一半点了根本播不了（VRM 只能播 vrma、PMX 只能播 vmd）。
         //   按模型类型过滤后：名字数量基本减半，且**清单里出现的必然能播**。
@@ -868,7 +879,7 @@ public partial class ThreeDeskPet(
     /// ★ 去重规则（这里踩过一个大坑）：**按「路径」去重，不按「文件名」**。
     ///   旧实现用裸文件名当身份、同名直接丢弃，于是各动作库里那些通用名（`动作.vmd`、`motion.vmd`、
     ///   `idle.vmd`…）互相顶掉 —— 几十个动作最后只剩一个，日志里成片刷
-    ///   `动作名重复，已跳过：动作（E:\Nyalume-...\手势舞比心\动作.vmd）` 就是它的指纹（用户实测"导入了但动作很少"）。
+    ///   `动作名重复，已跳过：动作（手势舞比心\动作.vmd）` 就是它的指纹（实测"导入了但动作很少"）。
     ///   现在：同一个文件被多个扫描根重复扫到才跳过；显示名用「子目录/文件名」保证可区分，
     ///   万一仍重名就加 ` (2)` 序号 —— **任何情况下都不再丢动作**。
     /// </summary>
@@ -888,7 +899,7 @@ public partial class ThreeDeskPet(
             string dirOf = Path.GetDirectoryName(f) ?? "";
             string parent = Path.GetFileName(dirOf);
             // ★ v11.49：父目录只是**格式文件夹**（vmd / vrma / motions…）时，改用**再上一层**（曲名）当前缀。
-            //   实测 E:\VRMA 的结构是 `<曲名>\<曲名>\vmd\<曲名>.vmd` ⇒ 旧逻辑给出的名字全是
+            //   实测动作库的结构是 `<曲名>\<曲名>\vmd\<曲名>.vmd` ⇒ 旧逻辑给出的名字全是
             //   `vrma/xxx`、`vmd/xxx` —— 前缀是格式名，几十支舞都顶着同一个前缀，
             //   UI 里一长串根本没法按曲子找（用户："想挑动作放都不好找"）。
             //   跳过格式文件夹后名字变成 `<曲名>/<曲名>`，UI 端就能按曲名分组。
@@ -1157,6 +1168,10 @@ public partial class ThreeDeskPet(
             M("自动跳舞", "•", "setting", key: "dance", options: new[] { "1", "0" }, labels: new[] { "开", "关" }, value: Configuration.AutoDance ? "1" : "0"),
             M("跳舞风格", "•", "setting", key: "dance_style", options: new[] { "0", "1" }, labels: new[] { "随机", "顺序" }, value: Configuration.DanceStyle.ToString()),
             M("跳舞时长", "•", "setting", key: "dance_duration", options: new[] { "8", "14", "24" }, labels: new[] { "短", "中", "长" }, value: Fmt(Configuration.DanceDuration)),
+        }));
+        settings.Add(M("AI 工具", "🧠", children: new List<PetMenuItem>
+        {
+            M("表情文档注入", "•", "setting", key: "bodyexpress_doc", options: new[] { "1", "0" }, labels: new[] { "开", "关(省token)" }, value: Configuration.BodyExpressDoc ? "1" : "0"),
         }));
         settings.Add(M("触发回复(省token)", "💬", children: new List<PetMenuItem>
         {
@@ -1683,6 +1698,11 @@ public partial class ThreeDeskPet(
             case "embodied_expression":
                 Configuration.EmbodiedExpression = val == "1";
                 try { EmbodiedExpressionChanged?.Invoke(); } catch (Exception e) { AlifeLog.LogWarning("具身表情开关通知失败: " + e.Message); }
+                break;
+            // bodyexpress 长文档注入开关：关掉后不占上下文，工具仍注册（靠记忆插件）
+            case "bodyexpress_doc":
+                Configuration.BodyExpressDoc = val == "1";
+                try { BodyExpressDocChanged?.Invoke(); } catch (Exception e) { AlifeLog.LogWarning("表情文档开关通知失败: " + e.Message); }
                 break;
             // 情绪 → 表情映射（"happy=星星眼;angry=怒り"）：把情绪指到模型自己好看的那张脸
             case "embodied_face_map": Configuration.EmbodiedFaceMap = val; break;

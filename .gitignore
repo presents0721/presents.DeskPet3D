@@ -11,3 +11,31 @@ user-props.json
 *.log
 bin/
 obj/
+*.user
+*.suo
+node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 用户自备的模型 / 动作 / 权重（版权原因，不进仓库）
+*.vrm
+*.pmx
+*.pmd
+*.vmd
+*.vrma
+*.onnx
+*.onnx.gz
+*.gguf
+*.safetensors
+models/
+Models/
+
+# 发布产物与临时文件
+*.zip
+*.bak
+*.tmp
+.publish/
+dist/

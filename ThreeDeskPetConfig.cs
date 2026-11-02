@@ -285,6 +285,11 @@ public record ThreeDeskPetConfig
     public bool EmbodiedExpression { get; set; } = false;
 
     [Browsable(false)]
+    [Description("具身表情工具文档注入（默认开）：关闭后不再每轮注入 BodyExpressHost 的长说明（省上下文）；" +
+        "工具本身仍可用，但需要靠记忆插件/外部提示知道怎么调用。")]
+    public bool BodyExpressDoc { get; set; } = true;
+
+    [Browsable(false)]
     [Description("情绪→表情映射（一次设置、永久有效）：把情绪指到模型自己的某张脸，格式 \"happy=星星眼;angry=怒り\"。" +
         "留空=按候选表自动挑。之所以需要它：表情名只能靠猜语义，很多模型的 happy/joy 是闭眼笑，用户想要的脸可能是另一张。")]
     public string EmbodiedFaceMap { get; set; } = "";
@@ -311,7 +316,7 @@ public record ThreeDeskPetConfig
     public double BaseExpressionWeight { get; set; } = 0.6;
 
     [Description("额外动作目录（分号或换行分隔）：递归扫描其中的 .vrma/.vmd/.vrm，与模型 motions 文件夹合并进跳舞轮播。" +
-        "用于把 E:\\VRMA 这类动作库直接纳入，无需把文件拷进模型目录。例：E:\\VRMA 或 E:\\VRMA;F:\\舞蹈")]
+        "用于把外部动作库直接纳入，无需把文件拷进模型目录。例：动作库 或 动作库A;动作库B")]
     public string ExtraMotionPaths { get; set; } = "";
 
     // ★ v11.49（用户：动作库里同一支舞常同时放 .vmd 和 .vrma 两份，全列出来 200+ 个，吃 AI 的 token）
@@ -324,8 +329,8 @@ public record ThreeDeskPetConfig
     public int MotionListLimit { get; set; } = 0;
 
     [Description("额外模型目录（分号或换行分隔）：递归扫描其中的 .vrm/.pmx，与 Storage/<角色>/ThreeDeskPet/Models 一起列进右键“模型”子菜单，" +
-        "点一下直接切换、无需再递归选文件夹。用于把 E:\\VRM模型 这类模型库直接纳入。用“加载模型…”选一次文件夹后会自动记到这里。" +
-        "例：E:\\VRM模型 或 E:\\VRM模型;F:\\PMX")]
+        "点一下直接切换、无需再递归选文件夹。用于把外部模型库直接纳入。用“加载模型…”选一次文件夹后会自动记到这里。" +
+        "例：模型库 或 模型库A;模型库B")]
     public string ExtraModelPaths { get; set; } = "";
 
     [Description("画质（控制渲染像素比，省 GPU 显存与算力）：low=低(上限1.25)，med=中(上限1.5)，high=高(原生，默认)。高分屏上选低/中可明显降负载，且不再糊到没法看。")]
